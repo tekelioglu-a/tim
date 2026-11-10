@@ -44,7 +44,31 @@ static int timestamp(char *buf,size_t size) {
     time_t t=time(NULL); struct tm tm;
     return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
 }
-static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state, EVP_PKEY *key, const char *user) {
+static void display_verified(char *line,const char *user,
+                             EVP_PKEY *alice_pub,EVP_PKEY *bob_pub) {
+ if (strncmp(line,"FROM ",5)!=0) { printf("%s\n> ",line); return; }
+ char *from=line+5,*stamp=strchr(from,' ');
+ if (!stamp) { puts("[REJECTED malformed message]"); return; }
+ *stamp++=0;
+ char *sighex=strchr(stamp,' ');
+ if (!sighex) { puts("[REJECTED malformed message]"); return; }
+ *sighex++=0;
+ char *body=strchr(sighex,' ');
+ if (!body) { puts("[REJECTED malformed message]"); return; }
+ *body++=0;
+ EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:
+                !strcmp(from,"bob")?bob_pub:NULL;
+ unsigned char sig[SIG_LEN], transcript[MAX_LINE+128];size_t n=0;
+ if (!peer || !fromhex(sighex,sig,SIG_LEN) ||
+     !signed_message(from,user,stamp,body,transcript,sizeof(transcript),&n) ||
+     !ed_verify(peer,transcript,n,sig)) {
+     printf("[REJECTED unauthenticated message claimed from %s]\n> ",from);
+     return;
+ }
+ printf("[VERIFIED %s] %s %s\n> ",from,stamp,body);
+}
+static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state,
+                         EVP_PKEY *key,const char *user,EVP_PKEY *alice_pub,EVP_PKEY *bob_pub) {
     char buf[1024];size_t n=0;
     int ok=SSL_read_ex(ssl,buf,sizeof(buf),&n);
     if (ok!=1) return -1;
@@ -74,7 +98,7 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
                 *state=2;
                 printf("Enter: recipient message (or QUIT)\n> ");
             } else {
-                printf("%s\n> ",line);
+                display_verified(line,user,alice_pub,bob_pub);
             }
             fflush(stdout);
             *used=0; *overflow=0;
@@ -86,11 +110,13 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
     return 0;
 }
 int main(int argc,char **argv) {
-    if (argc!=5) {
-        fprintf(stderr,"Usage: %s HOST USER identity.key ca.crt\n",argv[0]);return 1;
+    if (argc!=7) {
+        fprintf(stderr,"Usage: %s HOST USER identity.key ca.crt alice.pub bob.pub\n",argv[0]);return 1;
     }
     EVP_PKEY *identity=load_key(argv[3],1);
     if (!identity) {fprintf(stderr,"Invalid Ed25519 private identity key\n");return 1;}
+    EVP_PKEY *alice_pub=load_key(argv[5],0),*bob_pub=load_key(argv[6],0);
+    if (!alice_pub || !bob_pub) {fprintf(stderr,"Missing trusted peer public keys\n");return 1;}
     SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());
     if (!ctx || SSL_CTX_set_min_proto_version(ctx,TLS1_3_VERSION)!=1 ||
         SSL_CTX_set_max_proto_version(ctx,TLS1_3_VERSION)!=1 ||
@@ -131,7 +157,7 @@ int main(int argc,char **argv) {
         int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
         if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
         if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
-            if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2])<0) {
+            if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2],alice_pub,bob_pub)<0) {
                 fprintf(stderr,"Server disconnected or TLS read failed\n");break;
             }
         }
@@ -152,12 +178,18 @@ int main(int argc,char **argv) {
             if (!*input || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
             char stamp[32];
             if (timestamp(stamp,sizeof(stamp))<0) break;
-            n=snprintf(out,sizeof(out),"MSG %s %s %s\n",input,stamp,body);
+            unsigned char transcript[MAX_LINE+128],sig[SIG_LEN];size_t tlen=0;
+            if (!signed_message(argv[2],input,stamp,body,transcript,sizeof(transcript),&tlen) ||
+                !ed_sign(identity,transcript,tlen,sig)) {
+                fprintf(stderr,"Message signing failed\n> ");continue;
+            }
+            char sighex[SIG_LEN*2+1];tohex(sig,SIG_LEN,sighex);
+            n=snprintf(out,sizeof(out),"MSG %s %s %s %s\n",input,stamp,sighex,body);
             if (n<0 || n>=MAX_LINE) { fprintf(stderr,"Message too long\n> ");continue; }
             if (send_line(ssl,out)<0) { fprintf(stderr,"TLS write failed\n");break; }
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
-    SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);
+    SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);EVP_PKEY_free(alice_pub);EVP_PKEY_free(bob_pub);
     return 0;
 }

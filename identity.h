@@ -44,4 +44,18 @@ static inline int ed_verify(EVP_PKEY *key,const unsigned char *msg,size_t len,co
  int ok=ctx && EVP_DigestVerifyInit(ctx,NULL,NULL,NULL,key)==1 && EVP_DigestVerify(ctx,sig,SIG_LEN,msg,len)==1;
  EVP_MD_CTX_free(ctx);return ok;
 }
+/* Unambiguous signed transcript: domain, length-prefixed fields. */
+static inline int signed_message(const char *from,const char *to,
+                                  const char *stamp,const char *body,
+                                  unsigned char *out,size_t cap,size_t *n) {
+ const char *fields[]={"messenger-msg-v1",from,to,stamp,body};
+ size_t at=0;
+ for(size_t i=0;i<5;i++) {
+  size_t z=strlen(fields[i]);
+  if(z>65535 || cap-at<z+2)return 0;
+  out[at++]=(unsigned char)(z>>8);out[at++]=(unsigned char)z;
+  memcpy(out+at,fields[i],z);at+=z;
+ }
+ *n=at;return 1;
+}
 #endif

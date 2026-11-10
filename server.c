@@ -93,9 +93,9 @@ static EVP_PKEY *identity_key(const char *user) {
     return NULL;
 }
 static int forward(const char *from, const char *to,
-                   const char *stamp, const char *body) {
+                   const char *stamp, const char *body, const char *signature) {
     char out[MAX_LINE + MAX_USER + 64];
-    int n = snprintf(out, sizeof(out), "FROM %s %s %s\n", from, stamp, body);
+    int n = snprintf(out, sizeof(out), "FROM %s %s %s %s\n", from, stamp, signature, body);
     if (n < 0 || (size_t)n >= sizeof(out)) return 0;
     int count = 0;
     pthread_mutex_lock(&clients_mu);
@@ -142,14 +142,19 @@ static int command(Client *c, char *line) {
         char *to = line+4, *stamp = strchr(to,' ');
         if (!stamp) { enqueue(c,"ERR Invalid message\n"); return 0; }
         *stamp++ = 0;
-        char *body = strchr(stamp,' ');
+        char *signature = strchr(stamp,' ');
+        if (!signature) { enqueue(c,"ERR Invalid message\n"); return 0; }
+        *signature++ = 0;
+        char *body = strchr(signature,' ');
         if (!body) { enqueue(c,"ERR Invalid message\n"); return 0; }
         *body++ = 0;
         while (*body == ' ') ++body;
-        if (!*to || strlen(to)>=MAX_USER || !valid_time(stamp) || !*body) {
+        if (!*to || strlen(to)>=MAX_USER || !valid_time(stamp) || strlen(signature)!=SIG_LEN*2 || !*body) {
             enqueue(c,"ERR Invalid message\n"); return 0;
         }
-        enqueue(c,forward(c->user,to,stamp,body) ? "SENT\n" : "ERR User not connected\n");
+        unsigned char decoded[SIG_LEN];
+        if (!fromhex(signature,decoded,SIG_LEN)) { enqueue(c,"ERR Invalid signature encoding\n"); return 0; }
+        enqueue(c,forward(c->user,to,stamp,body,signature) ? "SENT\n" : "ERR User not connected\n");
     } else enqueue(c,"ERR Unknown command\n");
     return 0;
 }
