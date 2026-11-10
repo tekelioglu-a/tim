@@ -123,11 +123,13 @@ static int send_user(SSL *ssl,EVP_PKEY *identity,const char *user,const char *pe
  int free_slot=0;for(int i=0;i<RECEIPT_MAX;i++)if(!ks->receipts[i].active)free_slot=1;
  if(!free_slot){fprintf(stderr,"[QUEUE FULL] %d messages awaiting delivery; message not sent\n",RECEIPT_MAX);return 0;}
  unsigned char payload[1200],id[16];char packet[3200],shortid[33];
- if(RAND_bytes(id,sizeof(id))!=1)return 0;
+ if(RAND_bytes(id,sizeof(id))!=1){OPENSSL_cleanse(payload,sizeof(payload));return 0;}
  payload[0]=3;memcpy(payload+1,id,16);memcpy(payload+17,msg,len);
- if(!send_encrypted(ssl,identity,user,peer,&ks->ratchet,payload,len+17,packet))return 0;
- if(!receipt_add(ks,id,packet))return 0;
- idhex(id,shortid);if(debug_mode)printf("[QUEUED] %.8s\n> ",shortid);else printf("|* |  %.8s\n> ",shortid);fflush(stdout);return 1;
+ int sent=send_encrypted(ssl,identity,user,peer,&ks->ratchet,payload,len+17,packet);
+ OPENSSL_cleanse(payload,sizeof(payload));
+ if(!sent){OPENSSL_cleanse(id,sizeof(id));return 0;}
+ if(!receipt_add(ks,id,packet)){OPENSSL_cleanse(id,sizeof(id));return 0;}
+ idhex(id,shortid);if(debug_mode)printf("[QUEUED] %.8s\n> ",shortid);else printf("|* |  %.8s\n> ",shortid);fflush(stdout);OPENSSL_cleanse(id,sizeof(id));return 1;
 }
 static void receipt_ack(KeyState *ks,const unsigned char id[16]){
  for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active && memcmp(ks->receipts[i].id,id,16)==0){
@@ -187,7 +189,7 @@ static void flush_queue(SSL *ssl,EVP_PKEY *identity,const char *user,KeyState *k
   }
   DEBUG("[DEBUG] Queued encrypted message submitted to relay for %s\n",ks->established_peer);done++;
  }
- if(done){for(int i=done;i<ks->qcount;i++)memcpy(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;for(int i=ks->qcount;i<QUEUE_MAX;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));}
+ if(done){for(int i=done;i<ks->qcount;i++)memmove(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;for(int i=ks->qcount;i<QUEUE_MAX;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));}
 }
 static int queue_message(KeyState *ks,const char *body){
  if(strlen(body)>USER_MESSAGE_MAX || ks->qcount>=QUEUE_MAX)return 0;
@@ -280,44 +282,47 @@ static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *
  unsigned char header[40],nonce[12],tag[16],cipher[1200],plain[1201];
  if(!fromhex(pieces[0],header,40) || !fromhex(pieces[1],nonce,12) ||
     !fromhex(pieces[2],tag,16) || !fromhex(pieces[3],cipher,clen)){
-    puts("[REJECTED ciphertext encoding]");return;}
+    puts("[REJECTED ciphertext encoding]");goto cleanup_plain;}
  unsigned char prior_pub[32];int had_prior=ks->ratchet.has_dhr;memcpy(prior_pub,ks->ratchet.dhr,32);
  int was_ready=ks->ratchet.has_cks;
  unsigned char packet_hash[32];unsigned int hash_len=0;
- if(EVP_Digest(body,strlen(body),packet_hash,&hash_len,EVP_sha256(),NULL)!=1 || hash_len!=32)return;
+ if(EVP_Digest(body,strlen(body),packet_hash,&hash_len,EVP_sha256(),NULL)!=1 || hash_len!=32)goto cleanup_plain;
  if(!dr_decrypt(&ks->ratchet,from,user,stamp,header,nonce,tag,cipher,clen,plain)){
     for(unsigned int k=0;k<ks->seen_count;k++)if(memcmp(packet_hash,ks->seen_packet[k],32)==0){
        unsigned char ack[17]={4};memcpy(ack+1,ks->seen[k],16);
        if(ks->ratchet.has_cks)send_encrypted(ssl,identity,user,from,&ks->ratchet,ack,sizeof(ack),NULL);
-       DEBUG("[DEBUG] Duplicate ciphertext; acknowledgement resent\n");return;
+       DEBUG("[DEBUG] Duplicate ciphertext; acknowledgement resent\n");goto cleanup_plain;
     }
-    puts("[REJECTED ratchet/authentication/replay]");return;}
+    puts("[REJECTED ratchet/authentication/replay]");goto cleanup_plain;}
  if(had_prior && memcmp(prior_pub,header,32)!=0)DEBUG("[DEBUG /rekey] Automatic DH ratchet transition from %s\n",from);
  if(!was_ready && ks->ratchet.has_cks){
    DEBUG("[DEBUG /rekey] Automatic DH ratchet activated for %s\n",from);
    flush_queue(ssl,identity,user,ks);
  }
- if(clen==1 && plain[0]==1){OPENSSL_cleanse(plain,sizeof(plain));return;}
- if(clen==17 && plain[0]==4){receipt_ack(ks,plain+1);OPENSSL_cleanse(plain,sizeof(plain));return;}
+ if(clen==1 && plain[0]==1)goto cleanup_plain;
+ if(clen==17 && plain[0]==4){receipt_ack(ks,plain+1);goto cleanup_plain;}
  if(clen>=18 && plain[0]==3){
   unsigned char id[16];memcpy(id,plain+1,16);
   unsigned char ack[17]={4};memcpy(ack+1,id,16);
   /* ACK is E2EE and never acknowledges a failed authentication. */
   if(!send_encrypted(ssl,identity,user,from,&ks->ratchet,ack,sizeof(ack),NULL))
    DEBUG("[DEBUG] Could not send encrypted delivery receipt\n");
-  if(already_seen(ks,id)){DEBUG("[DEBUG] Duplicate message ID suppressed\n");OPENSSL_cleanse(plain,sizeof(plain));return;}
+  if(already_seen(ks,id)){DEBUG("[DEBUG] Duplicate message ID suppressed\n");goto cleanup_plain;}
   remember_seen(ks,id,packet_hash);
   memmove(plain,plain+17,clen-17);clen-=17;
  }
  plain[clen]=0;
- if(memchr(plain,0,clen)){OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED binary text]");return;}
+ if(memchr(plain,0,clen)){puts("[REJECTED binary text]");goto cleanup_plain;}
  /* Reject control characters in authenticated peer text: do not execute terminal escapes. */
  for(size_t j=0;j<clen;j++)if(plain[j]<32 || plain[j]==127){
-   OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED control character in message]");return;
+   puts("[REJECTED control character in message]");goto cleanup_plain;
  }
  if(debug_mode)printf("[E2EE VERIFIED %s]\n",from);
  printf("%s [%c%s]\n%s\n> ",stamp,(char)toupper((unsigned char)from[0]),from+1,plain);
+cleanup_plain:
  OPENSSL_cleanse(plain,sizeof(plain));
+ OPENSSL_cleanse(cipher,sizeof(cipher));
+ OPENSSL_cleanse(packet_hash,sizeof(packet_hash));
 }
 static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state,
                          EVP_PKEY *key,const char *user,EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
@@ -453,7 +458,7 @@ int main(int argc,char **argv) {
                 if(input_len){
                     /* Remove an entire UTF-8 codepoint, not just its final byte. */
                     do { --input_len; } while(input_len && ((unsigned char)input[input_len]&0xc0)==0x80);
-                    input[input_len]=0;
+                    OPENSSL_cleanse(input+input_len,sizeof(input)-input_len);
                     if(tty_changed){fputs("\r\033[2K> ",stdout);fwrite(input,1,input_len,stdout);fflush(stdout);}
                 }
                 continue;
@@ -461,7 +466,7 @@ int main(int argc,char **argv) {
             if(ch!='\n' && ch!='\r'){
                 if(ch<32 || ch==127)continue; /* Never send terminal control characters. */
                 if(input_len+1>=sizeof(input)){
-                    fprintf(stderr,"\nInput too long; line cleared\n> ");input_len=0;input[0]=0;continue;
+                    fprintf(stderr,"\nInput too long; line cleared\n> ");input_len=0;OPENSSL_cleanse(input,sizeof(input));continue;
                 }
                 input[input_len++]=(char)ch;input[input_len]=0;
                 if(tty_changed){fputc(ch,stdout);fflush(stdout);}
@@ -471,33 +476,33 @@ int main(int argc,char **argv) {
             input[input_len]=0;input_len=0;
             char command[MAX_LINE];
             memcpy(command,input,strlen(input)+1);
-            input[0]=0; /* Never redraw the previous command. */
-            if(!*command){if(tty_changed){fputs("> ",stdout);fflush(stdout);}continue;}
+            OPENSSL_cleanse(input,sizeof(input)); /* Never retain the typed plaintext. */
+            if(!*command){if(tty_changed){fputs("> ",stdout);fflush(stdout);} {OPENSSL_cleanse(command,sizeof(command));continue;}}
             if (!strcmp(command,"QUIT")) { send_line(ssl,"QUIT\n");break; }
             if(command[0]=='/') {
-                fprintf(stderr,"Commands /key and /rekey are automatic. Type: recipient message\n> ");continue;
+                fprintf(stderr,"Commands /key and /rekey are automatic. Type: recipient message\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
             }
             char *body=strchr(command,' ');
-            if (!body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
+            if (!body) { fprintf(stderr,"Usage: recipient message\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;} }
             *body++=0;while (*body==' ') ++body;
-            if (!*command || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
+            if (!*command || !*body) { fprintf(stderr,"Usage: recipient message\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;} }
             if((strcmp(command,"alice") && strcmp(command,"bob")) || !strcmp(command,argv[2])){
-                fprintf(stderr,"Unknown recipient\n> ");continue;
+                fprintf(stderr,"Unknown recipient\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
             }
             if(ks.established && strcmp(ks.established_peer,command)){
-                fprintf(stderr,"[ERROR] This prototype supports only one active peer\n> ");continue;
+                fprintf(stderr,"[ERROR] This prototype supports only one active peer\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
             }
             if(ks.pending && strcmp(ks.pending_peer,command)){
-                fprintf(stderr,"[ERROR] Key exchange already in progress for another peer\n> ");continue;
+                fprintf(stderr,"[ERROR] Key exchange already in progress for another peer\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
             }
             if(ks.established && ks.ratchet.has_cks && ks.qcount==0){
                 if(!send_user(ssl,identity,argv[2],command,&ks,body)){
-                    fprintf(stderr,"Encryption failed (maximum message length: 1183 bytes or receipt queue full)\n> ");continue;
+                    fprintf(stderr,"Encryption failed (maximum message length: 1183 bytes or receipt queue full)\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
                 }
                 DEBUG("[DEBUG] Encrypted message submitted to relay for %s\n",command);
             }else{
                 if(!queue_message(&ks,body)){
-                    fprintf(stderr,"[ERROR] Message exceeds 1183 bytes or pending queue is full\n> ");continue;
+                    fprintf(stderr,"[ERROR] Message exceeds 1183 bytes or pending queue is full\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
                 }
                 if(!ks.established && !ks.pending && !key_initiate(ssl,identity,argv[2],command,&ks)){
                     fprintf(stderr,"[ERROR] Automatic key exchange failed\n> ");
@@ -506,12 +511,17 @@ int main(int argc,char **argv) {
                 }
                 if(tty_changed){fputs("> ",stdout);fflush(stdout);}
             }
+            OPENSSL_cleanse(command,sizeof(command));
 
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
     if(tty_changed)tcsetattr(STDIN_FILENO,TCSANOW,&oldtty);
     EVP_PKEY_free(ks.pending);dr_free(&ks.ratchet);
+    OPENSSL_cleanse(&ks,sizeof(ks));
+    OPENSSL_cleanse(input,sizeof(input));
+    OPENSSL_cleanse(line,sizeof(line));
+    OPENSSL_cleanse(out,sizeof(out));
     SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);EVP_PKEY_free(alice_pub);EVP_PKEY_free(bob_pub);
     return 0;
 }

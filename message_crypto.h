@@ -38,6 +38,7 @@ static inline int aead_crypt(int enc,const unsigned char key[32],const unsigned 
  if(ok && !enc)ok=EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_TAG,16,tag)==1;
  if(ok)ok=EVP_CipherFinal_ex(c,out+n,&m)==1;
  if(ok && enc)ok=EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_GET_TAG,16,tag)==1;
+ if(!ok && !enc && out)OPENSSL_cleanse(out,len);
  EVP_CIPHER_CTX_free(c);return ok;
 }
 static inline int message_aad(const char *from,const char *to,const char *stamp,

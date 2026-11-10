@@ -103,3 +103,17 @@ digits identify the same message across status lines. These are separate
 status lines, not in-place rewrites. Use `-d` for detailed receipt and
 verification messages. Debug verification appears on its own line above
 the timestamp and message.
+
+
+### Volatile sensitive-buffer erasure
+
+The client calls `OPENSSL_cleanse()` on outgoing plaintext payloads after encryption,
+received plaintext after processing (including error/duplicate paths), typed
+commands after dispatch, queued plaintext after sending or cancellation, and
+session/receipt state on shutdown. Ratchet temporary material is cleared as
+soon as no longer needed. AEAD decryption failure clears the output buffer.
+
+**Limitations:** This is best-effort buffer erasure, not a guarantee against
+swap, hibernation, crash dumps, terminal scrollback, or copies inside OpenSSL
+or other libraries. Memory locking and OS-specific protections are deferred.
+The relay receives ciphertext, not plaintext.

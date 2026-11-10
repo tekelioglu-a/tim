@@ -93,7 +93,7 @@ static inline int dr_encrypt(DRState *s,const char *from,const char *to,const ch
   ok=dr_aad(from,to,stamp,hh,aad,sizeof(aad),&alen) && RAND_bytes(nonce,12)==1 &&
   aead_crypt(1,mk,nonce,aad,alen,plain,len,cipher,tag);}
  if(ok){memcpy(s->cks,next,32);s->ns++;}
- OPENSSL_cleanse(next,32);OPENSSL_cleanse(mk,32);return ok;
+ OPENSSL_cleanse(next,32);OPENSSL_cleanse(mk,32);OPENSSL_cleanse(aad,sizeof(aad));return ok;
 }
 static inline int dr_decrypt(DRState *s,const char *from,const char *to,const char *stamp,
  const unsigned char header[40],const unsigned char nonce[12],const unsigned char tag[16],
@@ -118,7 +118,7 @@ static inline int dr_decrypt(DRState *s,const char *from,const char *to,const ch
  if(ok){unsigned char tagcopy[16];memcpy(tagcopy,tag,16);
   ok=aead_crypt(0,mk,nonce,aad,alen,cipher,len,plain,tagcopy);
   OPENSSL_cleanse(tagcopy,16);}
- if(ok){dr_free(s);*s=t;memset(&t,0,sizeof(t));}
- done:dr_free(&t);OPENSSL_cleanse(mk,32);return ok;
+ if(ok){dr_free(s);*s=t;OPENSSL_cleanse(&t,sizeof(t));}
+ done:dr_free(&t);OPENSSL_cleanse(mk,32);OPENSSL_cleanse(aad,sizeof(aad));return ok;
 }
 #endif
