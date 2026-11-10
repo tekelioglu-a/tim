@@ -139,12 +139,14 @@ static void remove_client(Client *c)
 /* Forward a message to all connected sessions of recipient */
 static int forward_message(const char *sender,
                            const char *recipient,
+                           const char *timestamp,
                            const char *body)
 {
     char output[MAX_LINE + MAX_USER + 16];
 
     int len = snprintf(output, sizeof(output),
-                       "FROM %s %s\n", sender, body);
+                   "FROM %s %s %s\n",
+                   sender, timestamp, body);
 
     if (len < 0 || (size_t)len >= sizeof(output))
         return -1;
@@ -218,6 +220,38 @@ static void *client_thread(void *arg)
         }
 
         char *recipient = line + 4;
+		char *timestamp = strchr(recipient, ' ');
+
+		if (!timestamp) {
+			send_line(c->fd, "ERR Missing timestamp\n");
+			continue;
+		}
+
+		*timestamp++ = '\0';
+
+		char *body = strchr(timestamp, ' ');
+
+		if (!body) {
+			send_line(c->fd, "ERR Missing message body\n");
+			continue;
+		}
+
+		*body++ = '\0';
+
+		while (*body == ' ')
+			body++;
+
+		if (!*recipient || !*timestamp || !*body ||
+			strlen(recipient) >= MAX_USER ||
+			strlen(timestamp) != 20) {
+			send_line(c->fd, "ERR Invalid message\n");
+			continue;
+		}
+
+		int delivered = forward_message(
+			c->username, recipient, timestamp, body);
+			
+		
         char *body = strchr(recipient, ' ');
 
         if (!body) {

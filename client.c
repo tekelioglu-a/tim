@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <errno.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -12,6 +13,16 @@
 
 #define PORT      5555
 #define MAX_LINE  4096
+
+static void get_timestamp(char *buf, size_t size)
+{
+    time_t now = time(NULL);
+    struct tm tm_utc;
+
+    gmtime_r(&now, &tm_utc);
+
+    strftime(buf, size, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+}
 
 static int send_all(int fd, const char *buf, size_t len)
 {
@@ -202,10 +213,46 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            char output[MAX_LINE + 8];
 
-            snprintf(output, sizeof(output),
-                     "MSG %s\n", line);
+			char recipient[MAX_LINE];
+			char *body = strchr(line, ' ');
+
+			if (!body) {
+				printf("Usage: recipient message\n");
+				continue;
+			}
+
+			size_t recipient_len = (size_t)(body - line);
+
+			if (recipient_len == 0 || recipient_len >= sizeof(recipient)) {
+				printf("Invalid recipient\n");
+				continue;
+			}
+
+			memcpy(recipient, line, recipient_len);
+			recipient[recipient_len] = '\0';
+
+			while (*body == ' ')
+				body++;
+
+			if (!*body) {
+				printf("Empty message\n");
+				continue;
+			}
+
+			char timestamp[32];
+			get_timestamp(timestamp, sizeof(timestamp));
+
+			char output[MAX_LINE + 64];
+
+			int n = snprintf(output, sizeof(output),
+							 "MSG %s %s %s\n",
+							 recipient, timestamp, body);
+
+			if (n < 0 || (size_t)n >= sizeof(output)) {
+				printf("Message too long\n");
+				continue;
+			}
 
             if (send_line(fd, output) < 0) {
                 printf("Send failed\n");
@@ -222,4 +269,5 @@ int main(int argc, char **argv)
 
     return EXIT_SUCCESS;
 }
+
 
