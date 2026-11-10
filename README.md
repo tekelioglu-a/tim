@@ -1,15 +1,17 @@
-# Stage 6: authenticated ephemeral X25519 handshake (experimental)
+# Stage 7: Experimental E2EE text messages
 
-Build (OpenSSL 3.x development headers, GCC, Linux):
+**Educational prototype only. Not Signal Double Ratchet and not production secure.**
+
+Build on Linux with OpenSSL 3 development headers:
 
 ```sh
 gcc -Wall -Wextra -Wpedantic -Werror -O2 -pthread server.c -o server -lssl -lcrypto
 gcc -Wall -Wextra -Wpedantic -Werror -O2 client.c -o client -lssl -lcrypto
 ```
 
-If starting from scratch **for local testing only**, run `sh make-certs.sh` and `sh make-identities.sh`. Do not regenerate existing trusted identity keys; reuse your existing `alice.key`, `bob.key`, `alice.pub`, `bob.pub`, `ca.crt`, `server.crt`, `server.key` instead.
+For a fresh *local test only* run `sh make-certs.sh` and `sh make-identities.sh`. **Never regenerate an existing user's identity keys**; copy the existing trusted identity files instead.
 
-In three terminals:
+Run in three terminals:
 
 ```sh
 ./server server.crt server.key alice.pub bob.pub
@@ -17,12 +19,16 @@ In three terminals:
 ./client localhost bob bob.key ca.crt alice.pub bob.pub
 ```
 
-In Alice's terminal, type `/key bob`. Bob automatically authenticates the signed ephemeral X25519 request and replies with his own signed ephemeral public key. Both print `[STAGE6] Authenticated X25519/HKDF session established ...`. Regular messages still use `bob Hello` and remain **plaintext to the relay server**.
+Alice types `/key bob`, waits for `[STAGE6] ... session established`, then types `bob Hello Bob!`. Bob sees `[E2EE VERIFIED alice] ... Hello Bob!` and can respond with `alice Hello Alice!`.
 
-## Security boundaries
+Messages are encrypted client-side using AES-256-GCM and signed with Ed25519. The server sees `E7:counter:nonce:tag:ciphertext` rather than plaintext. Each direction derives a new 32-byte message key and advances its chain after successful processing. AES-GCM additionally authenticates sender, recipient, timestamp and counter as associated data. The TLS 1.3 layer remains in place.
 
-* Stage 6 demonstrates authenticated key agreement, not encrypted messaging. It derives a 32-byte session secret in client memory and does not use or print it.
-* The Ed25519 public keys must already be verified independently. X25519 public keys are signed with those identities; server forwards but cannot substitute them without detection.
-* The session is volatile, one peer at a time, and does not implement key confirmation, anti-replay persistence, concurrent sessions, offline key delivery, transcript persistence, ratcheting, or secure message encryption.
-* A valid previously signed INIT can be replayed by a malicious relay. A later production design must address replay and session lifecycle explicitly.
-* **Not Signal, not X3DH/PQXDH, not Double Ratchet, and not production-ready.** Do not use for sensitive conversations.
+## Important limitations
+
+* This is a **sequential, in-memory, single-peer demonstration**, not Signal's Double Ratchet. No ongoing DH ratchet, offline delivery, skipped-key storage, durable replay protection, or post-compromise recovery.
+* The signed X25519 handshake from Stage 6 lacks durable replay protection and explicit key confirmation. A malicious relay can replay handshake requests, with possible session resets and denial of service. No asynchronous prekeys.
+* Reordering, message loss, reconnection, simultaneous initiation, and multiple devices/sessions are **not handled safely**. A lost message desynchronizes the chain. The relay may fan out to multiple devices, which this demo cannot support.
+* Keys are in process memory; device capture, malicious endpoints, compromised identity keys, and traffic metadata remain threats. The server can block, reorder and replay traffic, and can see participants and ciphertext lengths.
+* Only `alice` and `bob` are supported. Text messages are limited to approximately 1200 bytes, and plaintext is not padded. No attachments or media.
+* The proposed separate X25519-derived XOR-pad layer has **not** been implemented.
+* No independent audit, fuzzing campaign, formal protocol review, or production hardening has been performed. Do not use for sensitive conversations.

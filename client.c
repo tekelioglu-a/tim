@@ -11,7 +11,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include "keyexchange.h"
+#include "message_crypto.h"
+#include <limits.h>
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -49,6 +50,8 @@ typedef struct {
  char pending_peer[64],sid[SID_LEN*2+1],initpub[DH_LEN*2+1];
  unsigned char session_key[DH_LEN];
  char established_peer[64];
+ unsigned char send_chain[32],recv_chain[32];
+ uint64_t send_count,recv_count;
  int established;
 } KeyState;
 static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
@@ -88,7 +91,8 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
     if(!ok){OPENSSL_cleanse(key,sizeof(key));puts("[KEY exchange failed]");return;}
     memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
     snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
-    state->established=1;
+    if(!ratchet_init(state->session_key,user,from,state->send_chain,state->recv_chain)) {puts("[Ratchet init failed]");state->established=0;return;}
+    state->send_count=state->recv_count=0;state->established=1;
     printf("[STAGE6] Authenticated X25519/HKDF session established with %s (responder)\n",from);
  } else {
     if(!state->pending || strcmp(state->pending_peer,from) || strcmp(state->sid,sid) ||
@@ -100,7 +104,8 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
     if(!ok){puts("[KEY derivation failed]");return;}
     memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
     snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
-    state->established=1;
+    if(!ratchet_init(state->session_key,user,from,state->send_chain,state->recv_chain)) {puts("[Ratchet init failed]");state->established=0;return;}
+    state->send_count=state->recv_count=0;state->established=1;
     printf("[STAGE6] Authenticated X25519/HKDF session established with %s (initiator)\n",from);
  }
  /* Stage 6 does NOT use this secret to encrypt messages yet. */
@@ -118,27 +123,50 @@ static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char 
  return 1;
 }
 static void display_verified(char *line,const char *user,
-                             EVP_PKEY *alice_pub,EVP_PKEY *bob_pub) {
- if (strncmp(line,"FROM ",5)!=0) { printf("%s\n> ",line); return; }
+                             EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
+ if(strncmp(line,"FROM ",5)!=0){printf("%s\n> ",line);return;}
  char *from=line+5,*stamp=strchr(from,' ');
- if (!stamp) { puts("[REJECTED malformed message]"); return; }
- *stamp++=0;
+ if(!stamp){puts("[REJECTED malformed message]");return;}*stamp++=0;
  char *sighex=strchr(stamp,' ');
- if (!sighex) { puts("[REJECTED malformed message]"); return; }
- *sighex++=0;
+ if(!sighex){puts("[REJECTED malformed message]");return;}*sighex++=0;
  char *body=strchr(sighex,' ');
- if (!body) { puts("[REJECTED malformed message]"); return; }
- *body++=0;
- EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:
-                !strcmp(from,"bob")?bob_pub:NULL;
- unsigned char sig[SIG_LEN], transcript[MAX_LINE+128];size_t n=0;
- if (!peer || !fromhex(sighex,sig,SIG_LEN) ||
-     !signed_message(from,user,stamp,body,transcript,sizeof(transcript),&n) ||
-     !ed_verify(peer,transcript,n,sig)) {
-     printf("[REJECTED unauthenticated message claimed from %s]\n> ",from);
-     return;
+ if(!body){puts("[REJECTED malformed message]");return;}*body++=0;
+ EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:!strcmp(from,"bob")?bob_pub:NULL;
+ unsigned char sig[SIG_LEN],transcript[MAX_LINE+128];size_t n=0;
+ if(!peer || !fromhex(sighex,sig,SIG_LEN) ||
+    !signed_message(from,user,stamp,body,transcript,sizeof(transcript),&n) ||
+    !ed_verify(peer,transcript,n,sig)){
+    printf("[REJECTED invalid signature from %s]\n> ",from);return;
  }
- printf("[VERIFIED %s] %s %s\n> ",from,stamp,body);
+ if(strncmp(body,"E7:",3)!=0){puts("[REJECTED unencrypted message]\n> ");return;}
+ if(!ks->established || strcmp(ks->established_peer,from)){
+    puts("[REJECTED no active encrypted session]\n> ");return;
+ }
+ char *ctr=body+3,*noncehex=strchr(ctr,':');if(!noncehex){puts("[REJECTED malformed ciphertext]");return;}
+ *noncehex++=0;char *taghex=strchr(noncehex,':');if(!taghex){puts("[REJECTED malformed ciphertext]");return;}
+ *taghex++=0;char *cipherhex=strchr(taghex,':');if(!cipherhex){puts("[REJECTED malformed ciphertext]");return;}
+ *cipherhex++=0;
+ if(!*ctr || strlen(ctr)>20 || (strlen(ctr)>1 && *ctr=='0')){puts("[REJECTED counter]");return;}
+ for(char *p=ctr;*p;p++)if(*p<'0'||*p>'9'){puts("[REJECTED counter]");return;}
+ errno=0;char *last=NULL;uint64_t counter=strtoull(ctr,&last,10);
+ if(errno || !last || *last || counter!=ks->recv_count){puts("[REJECTED replay/out-of-order message]");return;}
+ size_t clen=strlen(cipherhex)/2;
+ if(!clen || strlen(cipherhex)!=2*clen || clen>MAX_LINE/2){puts("[REJECTED ciphertext length]");return;}
+ unsigned char nonce[12],tag[16],cipher[MAX_LINE/2],plain[MAX_LINE/2+1];
+ if(!fromhex(noncehex,nonce,12)||!fromhex(taghex,tag,16)||!fromhex(cipherhex,cipher,clen)){
+    puts("[REJECTED ciphertext encoding]");return;
+ }
+ unsigned char key[32],next[32],aad[256];size_t aadlen=0;
+ int ok=ratchet_kdf(ks->recv_chain,"message",key) && ratchet_kdf(ks->recv_chain,"next",next) &&
+    message_aad(from,user,stamp,ctr,aad,sizeof(aad),&aadlen) &&
+    aead_crypt(0,key,nonce,aad,aadlen,cipher,clen,plain,tag);
+ OPENSSL_cleanse(key,sizeof(key));
+ if(!ok){OPENSSL_cleanse(next,sizeof(next));puts("[REJECTED authentication/tag failure]");return;}
+ memcpy(ks->recv_chain,next,32);OPENSSL_cleanse(next,sizeof(next));ks->recv_count++;
+ plain[clen]=0;
+ if(memchr(plain,0,clen)){puts("[REJECTED binary text]");return;}
+ printf("[E2EE VERIFIED %s] %s %s\n> ",from,stamp,plain);
+ OPENSSL_cleanse(plain,sizeof(plain));
 }
 static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state,
                          EVP_PKEY *key,const char *user,EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
@@ -172,7 +200,7 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
                 printf("Enter: recipient message (or QUIT)\n> ");
             } else {
                 if(!strncmp(line,"KEYFROM ",8))key_receive(ssl,line,user,key,alice_pub,bob_pub,ks);
-                else display_verified(line,user,alice_pub,bob_pub);
+                else display_verified(line,user,alice_pub,bob_pub,ks);
             }
             fflush(stdout);
             *used=0; *overflow=0;
@@ -257,6 +285,27 @@ int main(int argc,char **argv) {
             if (!*input || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
             char stamp[32];
             if (timestamp(stamp,sizeof(stamp))<0) break;
+            if(!ks.established || strcmp(ks.established_peer,input)){
+                fprintf(stderr,"No established E2EE session with %s; use /key %s first\n> ",input,input);continue;
+            }
+            char ctr[32],noncehex[25],taghex[33],bodyhex[MAX_LINE],encrypted[MAX_LINE];
+            snprintf(ctr,sizeof(ctr),"%" PRIu64,ks.send_count);
+            unsigned char nonce[12],tag[16],keybytes[32],next[32],aad[256];size_t aadlen=0;
+            size_t blen=strlen(body);unsigned char cipher[MAX_LINE];
+            if(blen>1200 || RAND_bytes(nonce,sizeof(nonce))!=1 ||
+               !ratchet_kdf(ks.send_chain,"message",keybytes) ||
+               !ratchet_kdf(ks.send_chain,"next",next) ||
+               !message_aad(argv[2],input,stamp,ctr,aad,sizeof(aad),&aadlen) ||
+               !aead_crypt(1,keybytes,nonce,aad,aadlen,(unsigned char*)body,blen,cipher,tag)){
+                OPENSSL_cleanse(keybytes,sizeof(keybytes));fprintf(stderr,"Encryption failed or message too long\n> ");continue;
+            }
+            OPENSSL_cleanse(keybytes,sizeof(keybytes));
+            tohex(nonce,12,noncehex);tohex(tag,16,taghex);tohex(cipher,blen,bodyhex);
+            int ez=snprintf(encrypted,sizeof(encrypted),"E7:%s:%s:%s:%s",ctr,noncehex,taghex,bodyhex);
+            if(ez<0 || (size_t)ez>=sizeof(encrypted)){
+                OPENSSL_cleanse(next,sizeof(next));fprintf(stderr,"Encrypted message too long\n> ");continue;
+            }
+            body=encrypted;
             unsigned char transcript[MAX_LINE+128],sig[SIG_LEN];size_t tlen=0;
             if (!signed_message(argv[2],input,stamp,body,transcript,sizeof(transcript),&tlen) ||
                 !ed_sign(identity,transcript,tlen,sig)) {
@@ -266,10 +315,12 @@ int main(int argc,char **argv) {
             n=snprintf(out,sizeof(out),"MSG %s %s %s %s\n",input,stamp,sighex,body);
             if (n<0 || n>=MAX_LINE) { fprintf(stderr,"Message too long\n> ");continue; }
             if (send_line(ssl,out)<0) { fprintf(stderr,"TLS write failed\n");break; }
+            memcpy(ks.send_chain,next,32);OPENSSL_cleanse(next,sizeof(next));ks.send_count++;
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
     EVP_PKEY_free(ks.pending);OPENSSL_cleanse(ks.session_key,sizeof(ks.session_key));
+    OPENSSL_cleanse(ks.send_chain,sizeof(ks.send_chain));OPENSSL_cleanse(ks.recv_chain,sizeof(ks.recv_chain));
     SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);EVP_PKEY_free(alice_pub);EVP_PKEY_free(bob_pub);
     return 0;
 }
