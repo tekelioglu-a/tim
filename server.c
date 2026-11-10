@@ -13,7 +13,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ctype.h>
-#include "identity.h"
+#include "keyexchange.h"
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -135,6 +135,34 @@ static int command(Client *c, char *line) {
         char out[128];snprintf(out,sizeof(out),"OK Logged in as %s\n",c->user);
         enqueue(c,out);
         printf("Authenticated Ed25519 identity: %s (fd=%d)\n",c->user,c->fd);
+    } else if (!strncmp(line,"KEY ",4)) {
+        if (!c->authenticated) { enqueue(c,"ERR Please log in first\n");return 0; }
+        /* KEY recipient INIT|REPLY sessionid initpub resppub signature */
+        char *fields[6]={0};char *save=NULL;
+        for (int i=0;i<6;i++) fields[i]=strtok_r(i?NULL:line+4," ",&save);
+        if (!fields[5] || strtok_r(NULL," ",&save) || !identity_key(fields[0]) ||
+            (strcmp(fields[1],"INIT") && strcmp(fields[1],"REPLY")) ||
+            strlen(fields[2])!=SID_LEN*2 || strlen(fields[3])!=DH_LEN*2 ||
+            (strcmp(fields[1],"INIT") ? strlen(fields[4])!=DH_LEN*2 : strcmp(fields[4],"-")) ||
+            strlen(fields[5])!=SIG_LEN*2) {
+            enqueue(c,"ERR Invalid key exchange\n");return 0;
+        }
+        unsigned char sid[SID_LEN],pub[DH_LEN],replypub[DH_LEN],sig[SIG_LEN];
+        if(!fromhex(fields[2],sid,SID_LEN) || !fromhex(fields[3],pub,DH_LEN) ||
+           (strcmp(fields[4],"-") && !fromhex(fields[4],replypub,DH_LEN)) ||
+           !fromhex(fields[5],sig,SIG_LEN)) {
+            enqueue(c,"ERR Invalid key encoding\n");return 0;
+        }
+        char out[MAX_LINE];int n=snprintf(out,sizeof(out),"KEYFROM %s %s %s %s %s %s\n",
+            c->user,fields[1],fields[2],fields[3],fields[4],fields[5]);
+        int count=0;
+        if(n>0 && (size_t)n<sizeof(out)) {
+            pthread_mutex_lock(&clients_mu);
+            for(Client *other=clients;other;other=other->next)
+                if(other->authenticated && !strcmp(other->user,fields[0]) && enqueue(other,out)==0)count++;
+            pthread_mutex_unlock(&clients_mu);
+        }
+        enqueue(c,count?"KEYSENT\n":"ERR Peer not connected\n");
     } else if (!strcmp(line,"QUIT")) {
         enqueue(c,"OK Goodbye\n"); return 1;
     } else if (!strncmp(line,"MSG ",4)) {

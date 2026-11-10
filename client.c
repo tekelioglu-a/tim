@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include "identity.h"
+#include "keyexchange.h"
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -44,6 +44,79 @@ static int timestamp(char *buf,size_t size) {
     time_t t=time(NULL); struct tm tm;
     return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
 }
+typedef struct {
+ EVP_PKEY *pending;
+ char pending_peer[64],sid[SID_LEN*2+1],initpub[DH_LEN*2+1];
+ unsigned char session_key[DH_LEN];
+ char established_peer[64];
+ int established;
+} KeyState;
+static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
+ const char *kind,const char *sid,const char *initpub,const char *resppub) {
+ unsigned char t[512],sig[SIG_LEN];size_t n=0;
+ char hex[SIG_LEN*2+1],line[512];
+ if(!dh_transcript(kind,from,to,sid,initpub,resppub,t,sizeof(t),&n) ||
+    !ed_sign(identity,t,n,sig))return 0;
+ tohex(sig,SIG_LEN,hex);
+ int z=snprintf(line,sizeof(line),"KEY %s %s %s %s %s %s\n",to,kind,sid,initpub,resppub,hex);
+ return z>0 && (size_t)z<sizeof(line) && send_line(ssl,line)==0;
+}
+static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
+ EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *state) {
+ char *parts[6],*save=NULL;
+ for(int i=0;i<6;i++)parts[i]=strtok_r(i?NULL:line+8," ",&save);
+ if(!parts[5] || strtok_r(NULL," ",&save)) {puts("[REJECTED malformed KEY]");return;}
+ char *from=parts[0],*kind=parts[1],*sid=parts[2],*initpub=parts[3],*resppub=parts[4],*sighex=parts[5];
+ EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:!strcmp(from,"bob")?bob_pub:NULL;
+ unsigned char sig[SIG_LEN],sidbytes[SID_LEN],initbytes[DH_LEN],replybytes[DH_LEN],transcript[512];size_t n=0;
+ if(!peer || !strcmp(from,user) || (strcmp(kind,"INIT") && strcmp(kind,"REPLY")) ||
+    !fromhex(sid,sidbytes,SID_LEN) || !fromhex(initpub,initbytes,DH_LEN) ||
+    (strcmp(kind,"INIT")? !fromhex(resppub,replybytes,DH_LEN):strcmp(resppub,"-")!=0) ||
+    !fromhex(sighex,sig,SIG_LEN) ||
+    !dh_transcript(kind,from,user,sid,initpub,resppub,transcript,sizeof(transcript),&n) ||
+    !ed_verify(peer,transcript,n,sig)) {
+    puts("[REJECTED unauthenticated KEY]");return;
+ }
+ if(!strcmp(kind,"INIT")) {
+    EVP_PKEY *mine=dh_generate();unsigned char mypub[DH_LEN],secret[DH_LEN],key[DH_LEN];char myhex[DH_LEN*2+1];
+    if(!mine || !dh_public(mine,mypub)) {puts("[KEY generation failed]");EVP_PKEY_free(mine);return;}
+    tohex(mypub,DH_LEN,myhex);
+    int ok=dh_secret(mine,initbytes,secret) &&
+       dh_derive_key(secret,from,user,sid,initpub,myhex,key) &&
+       key_send(ssl,identity,user,from,"REPLY",sid,initpub,myhex);
+    OPENSSL_cleanse(secret,sizeof(secret));EVP_PKEY_free(mine);
+    if(!ok){OPENSSL_cleanse(key,sizeof(key));puts("[KEY exchange failed]");return;}
+    memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
+    snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
+    state->established=1;
+    printf("[STAGE6] Authenticated X25519/HKDF session established with %s (responder)\n",from);
+ } else {
+    if(!state->pending || strcmp(state->pending_peer,from) || strcmp(state->sid,sid) ||
+       strcmp(state->initpub,initpub)) {puts("[REJECTED unexpected KEY reply]");return;}
+    unsigned char secret[DH_LEN],key[DH_LEN];
+    int ok=dh_secret(state->pending,replybytes,secret) &&
+           dh_derive_key(secret,user,from,sid,initpub,resppub,key);
+    OPENSSL_cleanse(secret,sizeof(secret));EVP_PKEY_free(state->pending);state->pending=NULL;
+    if(!ok){puts("[KEY derivation failed]");return;}
+    memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
+    snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
+    state->established=1;
+    printf("[STAGE6] Authenticated X25519/HKDF session established with %s (initiator)\n",from);
+ }
+ /* Stage 6 does NOT use this secret to encrypt messages yet. */
+}
+static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *state) {
+ if((strcmp(peer,"alice") && strcmp(peer,"bob")) || !strcmp(peer,user))return 0;
+ EVP_PKEY *mine=dh_generate();unsigned char pub[DH_LEN],sid[SID_LEN];
+ if(!mine || !dh_public(mine,pub) || RAND_bytes(sid,sizeof(sid))!=1){EVP_PKEY_free(mine);return 0;}
+ char pubhex[DH_LEN*2+1],sidhex[SID_LEN*2+1];tohex(pub,DH_LEN,pubhex);tohex(sid,SID_LEN,sidhex);
+ if(!key_send(ssl,identity,user,peer,"INIT",sidhex,pubhex,"-")){EVP_PKEY_free(mine);return 0;}
+ EVP_PKEY_free(state->pending);state->pending=mine;
+ strcpy(state->pending_peer,peer);
+ strcpy(state->sid,sidhex);strcpy(state->initpub,pubhex);
+ printf("[STAGE6] Sent signed ephemeral X25519 public key to %s\n",peer);
+ return 1;
+}
 static void display_verified(char *line,const char *user,
                              EVP_PKEY *alice_pub,EVP_PKEY *bob_pub) {
  if (strncmp(line,"FROM ",5)!=0) { printf("%s\n> ",line); return; }
@@ -68,7 +141,7 @@ static void display_verified(char *line,const char *user,
  printf("[VERIFIED %s] %s %s\n> ",from,stamp,body);
 }
 static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state,
-                         EVP_PKEY *key,const char *user,EVP_PKEY *alice_pub,EVP_PKEY *bob_pub) {
+                         EVP_PKEY *key,const char *user,EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
     char buf[1024];size_t n=0;
     int ok=SSL_read_ex(ssl,buf,sizeof(buf),&n);
     if (ok!=1) return -1;
@@ -98,7 +171,8 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
                 *state=2;
                 printf("Enter: recipient message (or QUIT)\n> ");
             } else {
-                display_verified(line,user,alice_pub,bob_pub);
+                if(!strncmp(line,"KEYFROM ",8))key_receive(ssl,line,user,key,alice_pub,bob_pub,ks);
+                else display_verified(line,user,alice_pub,bob_pub);
             }
             fflush(stdout);
             *used=0; *overflow=0;
@@ -150,6 +224,7 @@ int main(int argc,char **argv) {
         fprintf(stderr,"Login send failed\n");return 1;
     }
     char line[MAX_LINE];size_t used=0;int overflow=0,auth_state=0;
+    KeyState ks={0};
     struct pollfd fds[2]={{.fd=STDIN_FILENO,.events=POLLIN},
                           {.fd=fd,.events=POLLIN}};
     int done=0;
@@ -157,7 +232,7 @@ int main(int argc,char **argv) {
         int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
         if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
         if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
-            if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2],alice_pub,bob_pub)<0) {
+            if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2],alice_pub,bob_pub,&ks)<0) {
                 fprintf(stderr,"Server disconnected or TLS read failed\n");break;
             }
         }
@@ -172,6 +247,10 @@ int main(int argc,char **argv) {
             }
             input[strcspn(input,"\r\n")]=0;
             if (!strcmp(input,"QUIT")) { send_line(ssl,"QUIT\n");break; }
+            if (!strncmp(input,"/key ",5)) {
+                if(!key_initiate(ssl,identity,argv[2],input+5,&ks))fprintf(stderr,"Key initiation failed\n");
+                continue;
+            }
             char *body=strchr(input,' ');
             if (!body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
             *body++=0;while (*body==' ') ++body;
@@ -190,6 +269,7 @@ int main(int argc,char **argv) {
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
+    EVP_PKEY_free(ks.pending);OPENSSL_cleanse(ks.session_key,sizeof(ks.session_key));
     SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);EVP_PKEY_free(alice_pub);EVP_PKEY_free(bob_pub);
     return 0;
 }
