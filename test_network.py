@@ -46,9 +46,11 @@ def run(debug=False, initiator="alice"):
             first_name,second_name=('Alice','Bob') if initiator=='alice' else ('Bob','Alice')
             first.send(('bob ' if first is alice else 'alice ')+first_name+'1')
             second.until(first_name+'1')
+            first.until('[DELIVERED]')
             # The responder can now send without any user-visible ratchet setup.
             second.send(('bob ' if second is alice else 'alice ')+second_name+'1')
             first.until(second_name+'1')
+            second.until('[DELIVERED]')
             if debug:
                 first.until('[DEBUG /key]')
                 second.until('[DEBUG /rekey]')

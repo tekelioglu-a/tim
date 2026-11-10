@@ -20,6 +20,10 @@
 #define PORT "5555"
 #define MAX_LINE 4096
 #define QUEUE_MAX 16
+#define RECEIPT_MAX 32
+#define RETRY_SECONDS 60
+#define DELIVERY_WINDOW_SECONDS (3 * 60 * 60)
+#define USER_MESSAGE_MAX 1183
 static int debug_mode=0;
 #define DEBUG(...) do {if(debug_mode)fprintf(stderr,__VA_ARGS__);}while(0)
 
@@ -57,6 +61,14 @@ static int timestamp(char *buf,size_t size) {
     return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
 }
 typedef struct {
+ unsigned char id[16];
+ char packet[3200];
+ time_t last_sent;
+ time_t first_sent;
+ int attempts;
+ int active;
+} Receipt;
+typedef struct {
  EVP_PKEY *pending;
  char pending_peer[64],sid[SID_LEN*2+1],initpub[DH_LEN*2+1];
  char established_peer[64];
@@ -64,6 +76,10 @@ typedef struct {
  int established;
  char queued[QUEUE_MAX][1201];
  int qcount;
+ Receipt receipts[RECEIPT_MAX];
+ unsigned char seen[128][16];
+ unsigned int seen_count;
+ unsigned char seen_packet[128][32];
 } KeyState;
 static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  const char *kind,const char *sid,const char *initpub,const char *resppub) {
@@ -76,7 +92,7 @@ static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  return z>0 && (size_t)z<sizeof(line) && send_line(ssl,line)==0;
 }
 static int send_encrypted(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
- DRState *ratchet,const unsigned char *body,size_t blen) {
+ DRState *ratchet,const unsigned char *body,size_t blen,char *packet_out) {
  if(blen>1200 || !ratchet->has_cks)return 0;
  char stamp[32],headerhex[81],noncehex[25],taghex[33],bodyhex[2401],encrypted[2700],out[3200];
  unsigned char header[40],nonce[12],tag[16],cipher[1200],sig[SIG_LEN],transcript[3200];size_t tlen=0;
@@ -87,22 +103,93 @@ static int send_encrypted(SSL *ssl,EVP_PKEY *identity,const char *from,const cha
  !ed_sign(identity,transcript,tlen,sig))return 0;
  char sighex[SIG_LEN*2+1];tohex(sig,SIG_LEN,sighex);
  z=snprintf(out,sizeof(out),"MSG %s %s %s %s\n",to,stamp,sighex,encrypted);
- return z>0 && (size_t)z<sizeof(out) && send_line(ssl,out)==0;
+ if(z<=0 || (size_t)z>=sizeof(out))return 0;
+ if(packet_out)strcpy(packet_out,out);
+ return send_line(ssl,out)==0;
+}
+static void idhex(const unsigned char id[16],char out[33]){tohex(id,16,out);}
+static void receipt_clear(Receipt *r){
+ OPENSSL_cleanse(r,sizeof(*r));
+}
+static int receipt_add(KeyState *ks,const unsigned char id[16],const char *packet){
+ for(int i=0;i<RECEIPT_MAX;i++)if(!ks->receipts[i].active){
+  Receipt *r=&ks->receipts[i];receipt_clear(r);memcpy(r->id,id,16);strcpy(r->packet,packet);
+  r->last_sent=time(NULL);r->first_sent=r->last_sent;r->attempts=1;r->active=1;return 1;
+ }return 0;
+}
+static int send_user(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *ks,const char *msg){
+ size_t len=strlen(msg);if(len>USER_MESSAGE_MAX)return 0;
+ int free_slot=0;for(int i=0;i<RECEIPT_MAX;i++)if(!ks->receipts[i].active)free_slot=1;
+ if(!free_slot){fprintf(stderr,"[QUEUE FULL] %d messages awaiting delivery; message not sent\n",RECEIPT_MAX);return 0;}
+ unsigned char payload[1200],id[16];char packet[3200],shortid[33];
+ if(RAND_bytes(id,sizeof(id))!=1)return 0;
+ payload[0]=3;memcpy(payload+1,id,16);memcpy(payload+17,msg,len);
+ if(!send_encrypted(ssl,identity,user,peer,&ks->ratchet,payload,len+17,packet))return 0;
+ if(!receipt_add(ks,id,packet))return 0;
+ idhex(id,shortid);printf("[QUEUED] %.8s\n> ",shortid);fflush(stdout);return 1;
+}
+static void receipt_ack(KeyState *ks,const unsigned char id[16]){
+ for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active && memcmp(ks->receipts[i].id,id,16)==0){
+  char hex[33];idhex(id,hex);printf("[DELIVERED] %.8s\n> ",hex);
+  receipt_clear(&ks->receipts[i]);return;
+ }
+ DEBUG("[DEBUG] Unknown or duplicate delivery acknowledgement\n");
+}
+static int already_seen(KeyState *ks,const unsigned char id[16]){
+ for(unsigned int i=0;i<ks->seen_count;i++)if(!memcmp(ks->seen[i],id,16))return 1;
+ return 0;
+}
+static void remember_seen(KeyState *ks,const unsigned char id[16],const unsigned char hash[32]){
+ memcpy(ks->seen[ks->seen_count%128],id,16);
+ memcpy(ks->seen_packet[ks->seen_count%128],hash,32);
+ if(ks->seen_count<128)ks->seen_count++;
+ else {memmove(ks->seen,ks->seen+1,127*16);memcpy(ks->seen[127],id,16);
+ memmove(ks->seen_packet,ks->seen_packet+1,127*32);memcpy(ks->seen_packet[127],hash,32);}
+}
+static void retry_receipts(SSL *ssl,KeyState *ks){
+ time_t now=time(NULL);
+ for(int i=0;i<RECEIPT_MAX;i++){
+  Receipt *r=&ks->receipts[i];if(!r->active)continue;
+  char hex[33];idhex(r->id,hex);
+  if(now-r->first_sent>=DELIVERY_WINDOW_SECONDS){printf("[UNCONFIRMED] %.8s (3-hour acknowledgement window expired)\n> ",hex);receipt_clear(r);continue;}
+  if(now-r->last_sent<RETRY_SECONDS)continue;
+  if(send_line(ssl,r->packet)<0){DEBUG("[DEBUG] Retransmission failed\n");continue;}
+  r->last_sent=now;r->attempts++;DEBUG("[DEBUG] Retried encrypted packet %.8s attempt %d\n",hex,r->attempts);
+ }
+}
+/* An offline relay response invalidates the volatile peer session.  We do
+ * not re-encrypt undelivered messages: each is explicitly UNCONFIRMED. */
+static void peer_offline(KeyState *ks){
+ for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active){
+  char hex[33];idhex(ks->receipts[i].id,hex);
+  printf("[UNCONFIRMED] %.8s (peer offline)\n> ",hex);
+  receipt_clear(&ks->receipts[i]);
+ }
+ for(int i=0;i<ks->qcount;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));
+ ks->qcount=0;
+ EVP_PKEY_free(ks->pending);ks->pending=NULL;
+ dr_free(&ks->ratchet);
+ ks->established=0;
+ ks->pending_peer[0]=ks->established_peer[0]=ks->sid[0]=ks->initpub[0]=0;
+ OPENSSL_cleanse(ks->seen,sizeof(ks->seen));
+ OPENSSL_cleanse(ks->seen_packet,sizeof(ks->seen_packet));
+ ks->seen_count=0;
+ DEBUG("[DEBUG /key] Peer unavailable; old session discarded. Next message initiates new authenticated session.\n");
 }
 static void flush_queue(SSL *ssl,EVP_PKEY *identity,const char *user,KeyState *ks){
  if(!ks->established || !ks->ratchet.has_cks)return;
  int done=0;
  while(done<ks->qcount){
   const char *msg=ks->queued[done];
-  if(!send_encrypted(ssl,identity,user,ks->established_peer,&ks->ratchet,(const unsigned char*)msg,strlen(msg))){
+  if(!send_user(ssl,identity,user,ks->established_peer,ks,msg)){
    fprintf(stderr,"[ERROR] Queued message could not be encrypted or sent\n");break;
   }
   DEBUG("[DEBUG] Queued encrypted message submitted to relay for %s\n",ks->established_peer);done++;
  }
- if(done){for(int i=done;i<ks->qcount;i++)memcpy(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;}
+ if(done){for(int i=done;i<ks->qcount;i++)memcpy(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;for(int i=ks->qcount;i<QUEUE_MAX;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));}
 }
 static int queue_message(KeyState *ks,const char *body){
- if(strlen(body)>1200 || ks->qcount>=QUEUE_MAX)return 0;
+ if(strlen(body)>USER_MESSAGE_MAX || ks->qcount>=QUEUE_MAX)return 0;
  strcpy(ks->queued[ks->qcount++],body);return 1;
 }
 static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
@@ -147,7 +234,7 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
     /* The first encrypted ratchet message is an internal control frame.
        It advances Bob's receive chain and creates his sending chain. */
     const unsigned char bootstrap[1]={1};
-    if(!send_encrypted(ssl,identity,user,from,&state->ratchet,bootstrap,1)){
+    if(!send_encrypted(ssl,identity,user,from,&state->ratchet,bootstrap,1,NULL)){
        fprintf(stderr,"[ERROR] Automatic ratchet bootstrap failed\n");return;
     }
     DEBUG("[DEBUG /rekey] Initial automatic DH ratchet bootstrap sent to %s\n",from);
@@ -165,6 +252,9 @@ static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char 
 }
 static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *user,
                              EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
+ if(!strcmp(line,"ERR User not connected") || !strcmp(line,"ERR Peer not connected")){
+   peer_offline(ks);return;
+ }
  if(strncmp(line,"FROM ",5)!=0){if(!strcmp(line,"KEYSENT")){DEBUG("[DEBUG /key] Server acknowledged key-exchange frame\n");return;}if(!strcmp(line,"SENT")){DEBUG("[DEBUG] Relay accepted outgoing ciphertext (not a delivery receipt)\n");return;}printf("%s\n> ",line);return;}
  char *from=line+5,*stamp=strchr(from,' ');
  if(!stamp){puts("[REJECTED malformed message]");return;}*stamp++=0;
@@ -192,7 +282,14 @@ static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *
     puts("[REJECTED ciphertext encoding]");return;}
  unsigned char prior_pub[32];int had_prior=ks->ratchet.has_dhr;memcpy(prior_pub,ks->ratchet.dhr,32);
  int was_ready=ks->ratchet.has_cks;
+ unsigned char packet_hash[32];unsigned int hash_len=0;
+ if(EVP_Digest(body,strlen(body),packet_hash,&hash_len,EVP_sha256(),NULL)!=1 || hash_len!=32)return;
  if(!dr_decrypt(&ks->ratchet,from,user,stamp,header,nonce,tag,cipher,clen,plain)){
+    for(unsigned int k=0;k<ks->seen_count;k++)if(memcmp(packet_hash,ks->seen_packet[k],32)==0){
+       unsigned char ack[17]={4};memcpy(ack+1,ks->seen[k],16);
+       if(ks->ratchet.has_cks)send_encrypted(ssl,identity,user,from,&ks->ratchet,ack,sizeof(ack),NULL);
+       DEBUG("[DEBUG] Duplicate ciphertext; acknowledgement resent\n");return;
+    }
     puts("[REJECTED ratchet/authentication/replay]");return;}
  if(had_prior && memcmp(prior_pub,header,32)!=0)DEBUG("[DEBUG /rekey] Automatic DH ratchet transition from %s\n",from);
  if(!was_ready && ks->ratchet.has_cks){
@@ -200,6 +297,17 @@ static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *
    flush_queue(ssl,identity,user,ks);
  }
  if(clen==1 && plain[0]==1){OPENSSL_cleanse(plain,sizeof(plain));return;}
+ if(clen==17 && plain[0]==4){receipt_ack(ks,plain+1);OPENSSL_cleanse(plain,sizeof(plain));return;}
+ if(clen>=18 && plain[0]==3){
+  unsigned char id[16];memcpy(id,plain+1,16);
+  unsigned char ack[17]={4};memcpy(ack+1,id,16);
+  /* ACK is E2EE and never acknowledges a failed authentication. */
+  if(!send_encrypted(ssl,identity,user,from,&ks->ratchet,ack,sizeof(ack),NULL))
+   DEBUG("[DEBUG] Could not send encrypted delivery receipt\n");
+  if(already_seen(ks,id)){DEBUG("[DEBUG] Duplicate message ID suppressed\n");OPENSSL_cleanse(plain,sizeof(plain));return;}
+  remember_seen(ks,id,packet_hash);
+  memmove(plain,plain+17,clen-17);clen-=17;
+ }
  plain[clen]=0;
  if(memchr(plain,0,clen)){OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED binary text]");return;}
  /* Reject control characters in authenticated peer text: do not execute terminal escapes. */
@@ -320,8 +428,9 @@ int main(int argc,char **argv) {
     int done=0;
     while (!done) {
         fds[0].revents=fds[1].revents=0;
-        int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
+        int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,1000);
         if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
+        if(auth_state==2)retry_receipts(ssl,&ks);
         if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
             if(tty_changed && auth_state==2){fputs("\r\033[2K",stdout);fflush(stdout);}
             if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2],alice_pub,bob_pub,&ks)<0) {
@@ -380,13 +489,13 @@ int main(int argc,char **argv) {
                 fprintf(stderr,"[ERROR] Key exchange already in progress for another peer\n> ");continue;
             }
             if(ks.established && ks.ratchet.has_cks && ks.qcount==0){
-                if(!send_encrypted(ssl,identity,argv[2],command,&ks.ratchet,(const unsigned char*)body,strlen(body))){
-                    fprintf(stderr,"Encryption failed (maximum message length: 1200 bytes)\n> ");continue;
+                if(!send_user(ssl,identity,argv[2],command,&ks,body)){
+                    fprintf(stderr,"Encryption failed (maximum message length: 1183 bytes or receipt queue full)\n> ");continue;
                 }
                 DEBUG("[DEBUG] Encrypted message submitted to relay for %s\n",command);
             }else{
                 if(!queue_message(&ks,body)){
-                    fprintf(stderr,"[ERROR] Message exceeds 1200 bytes or pending queue is full\n> ");continue;
+                    fprintf(stderr,"[ERROR] Message exceeds 1183 bytes or pending queue is full\n> ");continue;
                 }
                 if(!ks.established && !ks.pending && !key_initiate(ssl,identity,argv[2],command,&ks)){
                     fprintf(stderr,"[ERROR] Automatic key exchange failed\n> ");
