@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include "identity.h"
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -43,7 +44,7 @@ static int timestamp(char *buf,size_t size) {
     time_t t=time(NULL); struct tm tm;
     return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
 }
-static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *logged_in) {
+static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state, EVP_PKEY *key, const char *user) {
     char buf[1024];size_t n=0;
     int ok=SSL_read_ex(ssl,buf,sizeof(buf),&n);
     if (ok!=1) return -1;
@@ -52,12 +53,29 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *log
             if (*overflow) { fprintf(stderr,"Server line too long\n"); return -1; }
             if (*used && line[*used-1]=='\r') --*used;
             line[*used]=0;
-            printf("%s\n",line);
-            if (*logged_in==0) {
-                if (strncmp(line,"OK ",3)!=0) return -1;
-                *logged_in=1;
+            if (*state==0) {
+                unsigned char nonce[NONCE_LEN],msg[128],sig[SIG_LEN];
+                size_t msglen=0;
+                if (strncmp(line,"CHALLENGE ",10)!=0 ||
+                    !fromhex(line+10,nonce,NONCE_LEN) ||
+                    !auth_message(user,nonce,msg,sizeof(msg),&msglen) ||
+                    !ed_sign(key,msg,msglen,sig)) {
+                    fprintf(stderr,"Invalid authentication challenge: %s\n",line);
+                    return -1;
+                }
+                char hex[SIG_LEN*2+1],out[160];
+                tohex(sig,SIG_LEN,hex);
+                snprintf(out,sizeof(out),"AUTH %s\n",hex);
+                if (send_line(ssl,out)<0)return -1;
+                *state=1;
+            } else if (*state==1) {
+                printf("%s\n",line);
+                if (strncmp(line,"OK Logged in as ",16)!=0)return -1;
+                *state=2;
                 printf("Enter: recipient message (or QUIT)\n> ");
-            } else printf("> ");
+            } else {
+                printf("%s\n> ",line);
+            }
             fflush(stdout);
             *used=0; *overflow=0;
         } else if (!*overflow) {
@@ -69,8 +87,10 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *log
 }
 int main(int argc,char **argv) {
     if (argc!=5) {
-        fprintf(stderr,"Usage: %s HOST USER PASSWORD ca.crt\n",argv[0]);return 1;
+        fprintf(stderr,"Usage: %s HOST USER identity.key ca.crt\n",argv[0]);return 1;
     }
+    EVP_PKEY *identity=load_key(argv[3],1);
+    if (!identity) {fprintf(stderr,"Invalid Ed25519 private identity key\n");return 1;}
     SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());
     if (!ctx || SSL_CTX_set_min_proto_version(ctx,TLS1_3_VERSION)!=1 ||
         SSL_CTX_set_max_proto_version(ctx,TLS1_3_VERSION)!=1 ||
@@ -99,11 +119,11 @@ int main(int argc,char **argv) {
     }
     printf("TLS: %s; certificate verified for %s\n",SSL_get_version(ssl),argv[1]);
     char out[MAX_LINE+128];
-    int n=snprintf(out,sizeof(out),"LOGIN %s %s\n",argv[2],argv[3]);
+    int n=snprintf(out,sizeof(out),"HELLO %s\n",argv[2]);
     if (n<0 || (size_t)n>=sizeof(out) || send_line(ssl,out)<0) {
         fprintf(stderr,"Login send failed\n");return 1;
     }
-    char line[MAX_LINE];size_t used=0;int overflow=0,logged_in=0;
+    char line[MAX_LINE];size_t used=0;int overflow=0,auth_state=0;
     struct pollfd fds[2]={{.fd=STDIN_FILENO,.events=POLLIN},
                           {.fd=fd,.events=POLLIN}};
     int done=0;
@@ -111,12 +131,12 @@ int main(int argc,char **argv) {
         int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
         if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
         if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
-            if (read_messages(ssl,line,&used,&overflow,&logged_in)<0) {
+            if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2])<0) {
                 fprintf(stderr,"Server disconnected or TLS read failed\n");break;
             }
         }
         if (fds[1].revents & (POLLERR|POLLHUP|POLLNVAL)) break;
-        if (logged_in && (fds[0].revents & POLLIN)) {
+        if (auth_state==2 && (fds[0].revents & POLLIN)) {
             char input[MAX_LINE];
             if (!fgets(input,sizeof(input),stdin)) break;
             size_t len=strlen(input);
@@ -138,6 +158,6 @@ int main(int argc,char **argv) {
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
-    SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);
+    SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);
     return 0;
 }

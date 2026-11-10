@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ctype.h>
+#include "identity.h"
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -27,7 +28,8 @@ typedef struct Message {
 typedef struct Client {
     struct Client *next;
     SSL *ssl;
-    int fd, wake[2], authenticated;
+    int fd, wake[2], authenticated, challenged;
+    unsigned char nonce[NONCE_LEN];
     char user[MAX_USER];
     pthread_mutex_t mu;
     Message *head, *tail;
@@ -84,9 +86,11 @@ static int valid_time(const char *s) {
     }
     return 1;
 }
-static int authenticate(const char *u, const char *p) {
-    return (!strcmp(u,"alice") && !strcmp(p,"alice")) ||
-           (!strcmp(u,"bob") && !strcmp(p,"bob"));
+static EVP_PKEY *alice_key, *bob_key;
+static EVP_PKEY *identity_key(const char *user) {
+    if (!strcmp(user,"alice")) return alice_key;
+    if (!strcmp(user,"bob")) return bob_key;
+    return NULL;
 }
 static int forward(const char *from, const char *to,
                    const char *stamp, const char *body) {
@@ -102,18 +106,35 @@ static int forward(const char *from, const char *to,
     return count;
 }
 static int command(Client *c, char *line) {
-    if (!strncmp(line, "LOGIN ", 6)) {
-        char u[MAX_USER], p[MAX_USER], extra;
-        if (c->authenticated) { enqueue(c,"ERR Already logged in\n"); return 0; }
-        if (sscanf(line + 6, "%63s %63s %c", u, p, &extra) != 2 || !authenticate(u,p)) {
-            enqueue(c,"ERR Authentication failed\n"); return 0;
+    if (!strncmp(line,"HELLO ",6)) {
+        const char *u=line+6;
+        if (c->authenticated || c->challenged || strlen(u)>=MAX_USER || !identity_key(u)) {
+            enqueue(c,"ERR Invalid identity request\n"); return 0;
         }
-        pthread_mutex_lock(&clients_mu);
-        strcpy(c->user, u); c->authenticated = 1;
-        pthread_mutex_unlock(&clients_mu);
-        char out[128]; snprintf(out,sizeof(out),"OK Logged in as %s\n",u);
+        if (RAND_bytes(c->nonce,NONCE_LEN)!=1) {
+            enqueue(c,"ERR Random generator failure\n");return 1;
+        }
+        strcpy(c->user,u);c->challenged=1;
+        char hex[NONCE_LEN*2+1],out[96];
+        tohex(c->nonce,NONCE_LEN,hex);
+        snprintf(out,sizeof(out),"CHALLENGE %s\n",hex);
         enqueue(c,out);
-        printf("Login: %s (fd=%d)\n",u,c->fd);
+    } else if (!strncmp(line,"AUTH ",5)) {
+        unsigned char sig[SIG_LEN],msg[128];size_t msglen=0;
+        if (!c->challenged || c->authenticated ||
+            !fromhex(line+5,sig,SIG_LEN) ||
+            !auth_message(c->user,c->nonce,msg,sizeof(msg),&msglen) ||
+            !ed_verify(identity_key(c->user),msg,msglen,sig)) {
+            enqueue(c,"ERR Authentication failed\n");return 1;
+        }
+        c->challenged=0;
+        memset(c->nonce,0,sizeof(c->nonce));
+        pthread_mutex_lock(&clients_mu);
+        c->authenticated=1;
+        pthread_mutex_unlock(&clients_mu);
+        char out[128];snprintf(out,sizeof(out),"OK Logged in as %s\n",c->user);
+        enqueue(c,out);
+        printf("Authenticated Ed25519 identity: %s (fd=%d)\n",c->user,c->fd);
     } else if (!strcmp(line,"QUIT")) {
         enqueue(c,"OK Goodbye\n"); return 1;
     } else if (!strncmp(line,"MSG ",4)) {
@@ -231,8 +252,13 @@ cleanup:
     return NULL;
 }
 int main(int argc,char **argv) {
-    if (argc!=3) {
-        fprintf(stderr,"Usage: %s server.crt server.key\n",argv[0]); return 1;
+    if (argc!=5) {
+        fprintf(stderr,"Usage: %s server.crt server.key alice.pub bob.pub\n",argv[0]); return 1;
+    }
+    alice_key=load_key(argv[3],0);
+    bob_key=load_key(argv[4],0);
+    if (!alice_key || !bob_key) {
+        fprintf(stderr,"Could not load Ed25519 public identity keys\n");return 1;
     }
     signal(SIGPIPE,SIG_IGN);
     tls_ctx=SSL_CTX_new(TLS_server_method());
