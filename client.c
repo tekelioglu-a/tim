@@ -1,392 +1,143 @@
-
 #define _POSIX_C_SOURCE 200809L
-
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <time.h>
 #include <errno.h>
 #include <poll.h>
-#include <sys/types.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 
-#define PORT       "5555"
-#define MAX_LINE   4096
-#define MAX_OUTPUT (MAX_LINE + 128)
+#define PORT "5555"
+#define MAX_LINE 4096
 
-/* --------------------------------------------------------- */
-/* Sending                                                   */
-/* --------------------------------------------------------- */
-
-static int send_all(int fd, const char *data, size_t length)
-{
-    size_t sent = 0;
-
-    while (sent < length) {
-        ssize_t n = send(fd, data + sent, length - sent, 0);
-
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-
-        if (n == 0)
-            return -1;
-
-        sent += (size_t)n;
+static int send_line(SSL *ssl,const char *line) {
+    size_t len=strlen(line),off=0;
+    while (off<len) {
+        size_t written=0;
+        if (SSL_write_ex(ssl,line+off,len-off,&written)!=1) return -1;
+        off+=written;
     }
-
     return 0;
 }
-
-static int send_line(int fd, const char *line)
-{
-    return send_all(fd, line, strlen(line));
-}
-
-/* --------------------------------------------------------- */
-/* Timestamp                                                 */
-/* --------------------------------------------------------- */
-
-static int get_timestamp(char *buffer, size_t size)
-{
-    time_t now = time(NULL);
-    struct tm utc;
-
-    if (gmtime_r(&now, &utc) == NULL)
-        return -1;
-
-    if (strftime(buffer, size,
-                 "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
-        return -1;
-
-    return 0;
-}
-
-/* --------------------------------------------------------- */
-/* Connection                                                */
-/* --------------------------------------------------------- */
-
-static int connect_to_server(const char *host)
-{
-    struct addrinfo hints;
-    struct addrinfo *results = NULL;
-    struct addrinfo *rp;
-    int fd = -1;
-
-    memset(&hints, 0, sizeof(hints));
-
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    int gai = getaddrinfo(host, PORT, &hints, &results);
-
-    if (gai != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gai));
-        return -1;
+static int connect_host(const char *host) {
+    struct addrinfo hints={0},*res=NULL,*p;
+    hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
+    int e=getaddrinfo(host,PORT,&hints,&res);
+    if (e) { fprintf(stderr,"getaddrinfo: %s\n",gai_strerror(e)); return -1; }
+    int fd=-1;
+    for (p=res;p;p=p->ai_next) {
+        fd=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
+        if (fd<0) continue;
+        if (connect(fd,p->ai_addr,p->ai_addrlen)==0) break;
+        close(fd); fd=-1;
     }
-
-    for (rp = results; rp != NULL; rp = rp->ai_next) {
-        fd = socket(rp->ai_family,
-                    rp->ai_socktype,
-                    rp->ai_protocol);
-
-        if (fd < 0)
-            continue;
-
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
-
-        close(fd);
-        fd = -1;
-    }
-
-    freeaddrinfo(results);
-
+    freeaddrinfo(res);
     return fd;
 }
-
-/* --------------------------------------------------------- */
-/* Incoming server data                                      */
-/* --------------------------------------------------------- */
-
-static void process_server_data(const char *data, size_t length,
-                                char *line, size_t *used,
-                                int *too_long)
-{
-    for (size_t i = 0; i < length; i++) {
-        char ch = data[i];
-
-        if (ch == '\n') {
-            if (*too_long) {
-                printf("\n[Server message too long]\n");
-            } else {
-                line[*used] = '\0';
-
-                if (*used > 0 && line[*used - 1] == '\r')
-                    line[--(*used)] = '\0';
-
-                printf("\n%s\n", line);
-            }
-
-            *used = 0;
-            *too_long = 0;
-            printf("> ");
+static int timestamp(char *buf,size_t size) {
+    time_t t=time(NULL); struct tm tm;
+    return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
+}
+static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *logged_in) {
+    char buf[1024];size_t n=0;
+    int ok=SSL_read_ex(ssl,buf,sizeof(buf),&n);
+    if (ok!=1) return -1;
+    for (size_t i=0;i<n;i++) {
+        if (buf[i]=='\n') {
+            if (*overflow) { fprintf(stderr,"Server line too long\n"); return -1; }
+            if (*used && line[*used-1]=='\r') --*used;
+            line[*used]=0;
+            printf("%s\n",line);
+            if (*logged_in==0) {
+                if (strncmp(line,"OK ",3)!=0) return -1;
+                *logged_in=1;
+                printf("Enter: recipient message (or QUIT)\n> ");
+            } else printf("> ");
             fflush(stdout);
-
-            continue;
-        }
-
-        if (!*too_long) {
-            if (*used + 1 < MAX_LINE)
-                line[(*used)++] = ch;
-            else
-                *too_long = 1;
+            *used=0; *overflow=0;
+        } else if (!*overflow) {
+            if (*used+1<MAX_LINE) line[(*used)++]=buf[i];
+            else *overflow=1;
         }
     }
+    return 0;
 }
-
-/* --------------------------------------------------------- */
-/* Main                                                      */
-/* --------------------------------------------------------- */
-
-int main(int argc, char *argv[])
-{
-    if (argc != 4) {
-        fprintf(stderr,
-                "Usage: %s SERVER_IP USERNAME PASSWORD\n",
-                argv[0]);
-        return EXIT_FAILURE;
+int main(int argc,char **argv) {
+    if (argc!=5) {
+        fprintf(stderr,"Usage: %s HOST USER PASSWORD ca.crt\n",argv[0]);return 1;
     }
-
-    const char *server = argv[1];
-    const char *username = argv[2];
-    const char *password = argv[3];
-
-    int fd = connect_to_server(server);
-
-    if (fd < 0) {
-        perror("connect");
-        return EXIT_FAILURE;
+    SSL_CTX *ctx=SSL_CTX_new(TLS_client_method());
+    if (!ctx || SSL_CTX_set_min_proto_version(ctx,TLS1_3_VERSION)!=1 ||
+        SSL_CTX_set_max_proto_version(ctx,TLS1_3_VERSION)!=1 ||
+        SSL_CTX_load_verify_locations(ctx,argv[4],NULL)!=1) {
+        ERR_print_errors_fp(stderr);return 1;
     }
-
-    printf("Connected to %s:%s\n", server, PORT);
-
-    /* Automatic login. */
-    char login[MAX_OUTPUT];
-
-    int n = snprintf(login, sizeof(login),
-                     "LOGIN %s %s\n", username, password);
-
-    if (n < 0 || (size_t)n >= sizeof(login)) {
-        fprintf(stderr, "Login command too long\n");
-        close(fd);
-        return EXIT_FAILURE;
+    SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL);
+    int fd=connect_host(argv[1]);
+    if (fd<0) { perror("connect");return 1; }
+    SSL *ssl=SSL_new(ctx);
+    if (!ssl || SSL_set_fd(ssl,fd)!=1) { ERR_print_errors_fp(stderr);return 1; }
+    /* IP literals require IP SAN; hostnames require DNS SAN. */
+    unsigned char address[16];
+    if (inet_pton(AF_INET,argv[1],address)==1 ||
+        inet_pton(AF_INET6,argv[1],address)==1) {
+        if (SSL_set1_host(ssl,NULL)!=1 ||
+            X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl),argv[1])!=1) {
+            fprintf(stderr,"IP verification setup failed\n");return 1;
+        }
+    } else if (SSL_set1_host(ssl,argv[1])!=1) {
+        fprintf(stderr,"Hostname verification setup failed\n");return 1;
     }
-
-    if (send_line(fd, login) < 0) {
-        perror("send login");
-        close(fd);
-        return EXIT_FAILURE;
+    if (SSL_connect(ssl)!=1 || SSL_get_verify_result(ssl)!=X509_V_OK) {
+        fprintf(stderr,"TLS handshake/certificate verification failed\n");
+        ERR_print_errors_fp(stderr);return 1;
     }
-
-    /*
-     * Receive login response. Use a buffered read because
-     * TCP does not preserve message boundaries.
-     */
-    char server_line[MAX_LINE];
-    size_t server_used = 0;
-    int server_too_long = 0;
-    int logged_in = 0;
-
-    while (!logged_in) {
-        char buffer[1024];
-
-        ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-
-        if (received < 0) {
-            if (errno == EINTR)
-                continue;
-
-            perror("recv");
-            close(fd);
-            return EXIT_FAILURE;
-        }
-
-        if (received == 0) {
-            fprintf(stderr, "Server closed connection during login\n");
-            close(fd);
-            return EXIT_FAILURE;
-        }
-
-        for (ssize_t i = 0; i < received; i++) {
-            char ch = buffer[i];
-
-            if (ch == '\n') {
-                if (server_too_long) {
-                    fprintf(stderr, "Invalid server response\n");
-                    close(fd);
-                    return EXIT_FAILURE;
-                }
-
-                server_line[server_used] = '\0';
-
-                if (server_used > 0 &&
-                    server_line[server_used - 1] == '\r')
-                    server_line[--server_used] = '\0';
-
-                printf("%s\n", server_line);
-
-                if (strncmp(server_line, "OK ", 3) != 0) {
-                    close(fd);
-                    return EXIT_FAILURE;
-                }
-
-                logged_in = 1;
-                break;
-            }
-
-            if (!server_too_long) {
-                if (server_used + 1 < sizeof(server_line))
-                    server_line[server_used++] = ch;
-                else
-                    server_too_long = 1;
-            }
-        }
+    printf("TLS: %s; certificate verified for %s\n",SSL_get_version(ssl),argv[1]);
+    char out[MAX_LINE+128];
+    int n=snprintf(out,sizeof(out),"LOGIN %s %s\n",argv[2],argv[3]);
+    if (n<0 || (size_t)n>=sizeof(out) || send_line(ssl,out)<0) {
+        fprintf(stderr,"Login send failed\n");return 1;
     }
-
-    printf("\nEnter messages as: recipient message\n");
-    printf("Enter QUIT to disconnect.\n\n");
-    printf("> ");
-    fflush(stdout);
-
-    struct pollfd fds[2];
-
-    fds[0].fd = STDIN_FILENO;
-    fds[0].events = POLLIN;
-
-    fds[1].fd = fd;
-    fds[1].events = POLLIN;
-
-    char input[MAX_LINE];
-
-    server_used = 0;
-    server_too_long = 0;
-
-    for (;;) {
-        int ready = poll(fds, 2, -1);
-
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-
-            perror("poll");
-            break;
-        }
-
-        /* Incoming server data. */
-        if (fds[1].revents & POLLIN) {
-            char buffer[1024];
-
-            ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-
-            if (received == 0) {
-                printf("\nServer disconnected.\n");
-                break;
-            }
-
-            if (received < 0) {
-                if (errno == EINTR)
-                    continue;
-
-                perror("recv");
-                break;
-            }
-
-            process_server_data(buffer, (size_t)received,
-                                server_line, &server_used,
-                                &server_too_long);
-        }
-
-        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            printf("\nServer connection closed.\n");
-            break;
-        }
-
-        /* Keyboard input. */
-        if (fds[0].revents & POLLIN) {
-            if (fgets(input, sizeof(input), stdin) == NULL)
-                break;
-
-            input[strcspn(input, "\r\n")] = '\0';
-
-            if (strcmp(input, "QUIT") == 0) {
-                send_line(fd, "QUIT\n");
-                break;
-            }
-
-            if (*input == '\0') {
-                printf("> ");
-                fflush(stdout);
-                continue;
-            }
-
-            /* Separate recipient and message body. */
-            char *body = strchr(input, ' ');
-
-            if (body == NULL) {
-                printf("Usage: recipient message\n> ");
-                fflush(stdout);
-                continue;
-            }
-
-            *body++ = '\0';
-
-            while (*body == ' ')
-                body++;
-
-            if (*input == '\0' || *body == '\0') {
-                printf("Usage: recipient message\n> ");
-                fflush(stdout);
-                continue;
-            }
-
-            char timestamp[32];
-
-            if (get_timestamp(timestamp, sizeof(timestamp)) < 0) {
-                fprintf(stderr, "Could not generate timestamp\n");
-                continue;
-            }
-
-            char output[MAX_OUTPUT];
-
-            n = snprintf(output, sizeof(output),
-                         "MSG %s %s %s\n",
-                         input, timestamp, body);
-
-            if (n < 0 || (size_t)n >= sizeof(output)) {
-                printf("Message too long\n> ");
-                fflush(stdout);
-                continue;
-            }
-
-            if (send_all(fd, output, (size_t)n) < 0) {
-                perror("send");
-                break;
+    char line[MAX_LINE];size_t used=0;int overflow=0,logged_in=0;
+    struct pollfd fds[2]={{.fd=STDIN_FILENO,.events=POLLIN},
+                          {.fd=fd,.events=POLLIN}};
+    int done=0;
+    while (!done) {
+        int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
+        if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
+        if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
+            if (read_messages(ssl,line,&used,&overflow,&logged_in)<0) {
+                fprintf(stderr,"Server disconnected or TLS read failed\n");break;
             }
         }
-
-        if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
-            break;
+        if (fds[1].revents & (POLLERR|POLLHUP|POLLNVAL)) break;
+        if (logged_in && (fds[0].revents & POLLIN)) {
+            char input[MAX_LINE];
+            if (!fgets(input,sizeof(input),stdin)) break;
+            size_t len=strlen(input);
+            if (len && input[len-1]!='\n' && !feof(stdin)) {
+                int ch;while ((ch=getchar())!='\n' && ch!=EOF) {}
+                fprintf(stderr,"Input too long\n> ");continue;
+            }
+            input[strcspn(input,"\r\n")]=0;
+            if (!strcmp(input,"QUIT")) { send_line(ssl,"QUIT\n");break; }
+            char *body=strchr(input,' ');
+            if (!body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
+            *body++=0;while (*body==' ') ++body;
+            if (!*input || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
+            char stamp[32];
+            if (timestamp(stamp,sizeof(stamp))<0) break;
+            n=snprintf(out,sizeof(out),"MSG %s %s %s\n",input,stamp,body);
+            if (n<0 || n>=MAX_LINE) { fprintf(stderr,"Message too long\n> ");continue; }
+            if (send_line(ssl,out)<0) { fprintf(stderr,"TLS write failed\n");break; }
+        }
+        if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
-
-    close(fd);
-
-    printf("Disconnected.\n");
-
-    return EXIT_SUCCESS;
+    SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);
+    return 0;
 }
-
