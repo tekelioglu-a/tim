@@ -117,3 +117,24 @@ soon as no longer needed. AEAD decryption failure clears the output buffer.
 swap, hibernation, crash dumps, terminal scrollback, or copies inside OpenSSL
 or other libraries. Memory locking and OS-specific protections are deferred.
 The relay receives ciphertext, not plaintext.
+
+
+### Stage 8H restart recovery (authenticated RESET)
+
+When a peer restarts, its volatile Double Ratchet keys are gone. If it receives
+old ciphertext, it rejects the packet and sends a **signed** `KEY RESET`
+request. The still-running peer verifies the Ed25519 signature and starts a
+new authenticated X25519 `INIT`/`REPLY` exchange. Importantly, a RESET request
+**does not immediately erase an established session**: old receipts are failed
+and the ratchet replaced only after the new REPLY proves possession of the
+fresh ephemeral key. The peer can also initiate the first post-restart message;
+that case is negotiated using RESET without discarding the queued message.
+
+Previously encrypted messages cannot be decrypted by the restarted peer and
+are **not automatically resent**. Their original sender-side receipts become
+`|*é|` when the obsolete session is replaced. Users may choose to resend.
+
+This is in-memory recovery, not durable delivery. A peer crash, server outage,
+replayed signed recovery request, or simultaneous restart can still cause
+message loss or temporary interruption; no persistent replay cache is kept.
+Run `sh test_all.sh` to exercise both restart directions.

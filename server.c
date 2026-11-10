@@ -1,3 +1,11 @@
+/*
+ * TIM TLS relay server.
+ *
+ * Authenticates connected users and forwards protocol frames. End-to-end
+ * message decryption belongs to the clients, not this relay. Each connection
+ * has one worker responsible for its SSL I/O; queued outgoing frames are
+ * synchronized across workers.
+ */
 #define _POSIX_C_SOURCE 200809L
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -48,6 +56,14 @@ static void notify(Client *c) {
     ssize_t n = write(c->wake[1], &b, 1);
     (void)n; /* EAGAIN means already readable */
 }
+/* Cross-thread delivery queue.
+ *
+ * The sender's worker can enqueue a frame for another connection, but only
+ * the destination worker may perform SSL_write_ex on that connection's SSL.
+ * Queue mutation is protected by c->mu; the wake pipe interrupts the worker's
+ * poll so it can flush output promptly. MAX_QUEUE_BYTES bounds memory use if
+ * a destination reads too slowly. Enqueueing means accepted for forwarding,
+ * not cryptographically delivered to the destination application. */
 static int enqueue(Client *c, const char *s) {
     size_t len = strlen(s);
     Message *m = malloc(sizeof(*m) + len);
@@ -70,6 +86,7 @@ static int has_output(Client *c) {
     pthread_mutex_unlock(&c->mu);
     return yes;
 }
+/* Detach a disconnected client from the shared client registry. */
 static void remove_client(Client *c) {
     pthread_mutex_lock(&clients_mu);
     Client **p = &clients;
@@ -92,6 +109,13 @@ static EVP_PKEY *identity_key(const char *user) {
     if (!strcmp(user,"bob")) return bob_key;
     return NULL;
 }
+/* Relay opaque ciphertext without participating in end-to-end decryption.
+ *
+ * The sender identity comes from the authenticated TLS connection, not from
+ * an untrusted field in the MSG command. The relay attaches that identity to
+ * the forwarded frame; the recipient independently checks the sender's
+ * Ed25519 signature and AES-GCM tag. The server neither derives ratchet keys
+ * nor produces end-to-end delivery acknowledgements. */
 static int forward(const char *from, const char *to,
                    const char *stamp, const char *body, const char *signature) {
     char out[MAX_LINE + MAX_USER + 64];
@@ -105,6 +129,16 @@ static int forward(const char *from, const char *to,
     pthread_mutex_unlock(&clients_mu);
     return count;
 }
+/* Relay protocol state machine.
+ *
+ * HELLO initiates a random challenge; AUTH proves possession of the user's
+ * Ed25519 private key by signing the challenge-bound transcript. KEY forwards
+ * peer handshake frames. MSG forwards a signed, opaque encrypted envelope.
+ * QUIT ends the connection. Syntax checks and TLS transport authentication
+ * are not substitutes for client-side end-to-end verification.
+ *
+ * This Stage 8H implementation deliberately supports two configured users,
+ * alice and bob; it is not yet a general account or key-directory service. */
 static int command(Client *c, char *line) {
     if (!strncmp(line,"HELLO ",6)) {
         const char *u=line+6;
@@ -141,9 +175,9 @@ static int command(Client *c, char *line) {
         char *fields[6]={0};char *save=NULL;
         for (int i=0;i<6;i++) fields[i]=strtok_r(i?NULL:line+4," ",&save);
         if (!fields[5] || strtok_r(NULL," ",&save) || !identity_key(fields[0]) ||
-            (strcmp(fields[1],"INIT") && strcmp(fields[1],"REPLY") && strcmp(fields[1],"RINIT") && strcmp(fields[1],"RREPLY")) ||
+            (strcmp(fields[1],"INIT") && strcmp(fields[1],"REPLY") && strcmp(fields[1],"RINIT") && strcmp(fields[1],"RREPLY") && strcmp(fields[1],"RESET")) ||
             strlen(fields[2])!=SID_LEN*2 || strlen(fields[3])!=DH_LEN*2 ||
-            ((strcmp(fields[1],"INIT") && strcmp(fields[1],"RINIT")) ? strlen(fields[4])!=DH_LEN*2 : strcmp(fields[4],"-")) ||
+            ((strcmp(fields[1],"INIT") && strcmp(fields[1],"RINIT") && strcmp(fields[1],"RESET")) ? strlen(fields[4])!=DH_LEN*2 : strcmp(fields[4],"-")) ||
             strlen(fields[5])!=SIG_LEN*2) {
             enqueue(c,"ERR Invalid key exchange\n");return 0;
         }
@@ -186,7 +220,13 @@ static int command(Client *c, char *line) {
     } else enqueue(c,"ERR Unknown command\n");
     return 0;
 }
-/* Only this thread calls SSL_read_ex/SSL_write_ex on this client's SSL. */
+/* Per-connection worker and OpenSSL I/O ownership.
+ *
+ * Only this thread calls SSL_read_ex/SSL_write_ex on c->ssl, avoiding
+ * concurrent use of a single SSL object. Other workers append to its output
+ * queue and wake it through a pipe. After the TLS handshake the socket is
+ * nonblocking, so the poll loop must handle short reads/writes and OpenSSL's
+ * WANT_READ/WANT_WRITE transitions without losing buffered frames. */
 static void *worker(void *arg) {
     Client *c = arg;
     char input[MAX_LINE]; size_t used = 0;

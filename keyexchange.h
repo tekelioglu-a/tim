@@ -1,3 +1,10 @@
+/*
+ * Authenticated-handshake building blocks.
+ *
+ * X25519 supplies shared-secret material; transcript construction binds
+ * identities, session IDs, and ephemeral public keys to their roles.
+ * Signature verification is performed by the protocol caller.
+ */
 #ifndef KEYEXCHANGE_H
 #define KEYEXCHANGE_H
 #include "identity.h"
@@ -5,7 +12,13 @@
 #include <openssl/crypto.h>
 #define DH_LEN 32
 #define SID_LEN 16
-/* Stage 6 is a live, single-peer handshake demonstration, not an E2EE protocol. */
+/* X25519 building blocks reused by the Stage 8H handshake.
+ *
+ * X25519 alone does not authenticate who supplied a public key. The caller
+ * must verify the Ed25519 signature over the full handshake transcript and
+ * bind the derived secret to both identities and the session identifier.
+ * The old Stage 6 note referred to the earlier standalone demonstration;
+ * these primitives are now components of the authenticated E2EE handshake. */
 static inline EVP_PKEY *dh_generate(void) {
  EVP_PKEY_CTX *ctx=EVP_PKEY_CTX_new_id(EVP_PKEY_X25519,NULL);
  EVP_PKEY *key=NULL;

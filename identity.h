@@ -1,3 +1,10 @@
+/*
+ * Identity and signed-transcript helpers.
+ *
+ * Ed25519 signatures authenticate the named peer and bind protocol fields
+ * using domain separation and explicit field lengths. These helpers do not
+ * replace TLS certificate verification or end-to-end AEAD authentication.
+ */
 #ifndef IDENTITY_H
 #define IDENTITY_H
 #include <openssl/evp.h>
@@ -19,7 +26,12 @@ static inline int fromhex(const char *src,unsigned char *dst,size_t n){
  for(size_t i=0;i<n;i++){int a=hexval(src[2*i]),b=hexval(src[2*i+1]);if(a<0||b<0)return 0;dst[i]=(unsigned char)((a<<4)|b);}
  return 1;
 }
-/* Domain-separated transcript: protocol label, username, and fresh server nonce. */
+/* Build the login challenge transcript.
+ *
+ * Including a fixed protocol label prevents this signature from being
+ * confused with signatures used for peer messages or key exchange. The
+ * username binds the response to the claimed account; a fresh server nonce
+ * prevents replay of an earlier successful login signature. */
 static inline int auth_message(const char *user,const unsigned char nonce[NONCE_LEN],unsigned char *buf,size_t cap,size_t *len){
  static const char label[]="messenger-auth-v1";
  size_t a=sizeof(label),b=strlen(user);
@@ -44,7 +56,12 @@ static inline int ed_verify(EVP_PKEY *key,const unsigned char *msg,size_t len,co
  int ok=ctx && EVP_DigestVerifyInit(ctx,NULL,NULL,NULL,key)==1 && EVP_DigestVerify(ctx,sig,SIG_LEN,msg,len)==1;
  EVP_MD_CTX_free(ctx);return ok;
 }
-/* Unambiguous signed transcript: domain, length-prefixed fields. */
+/* Canonical peer-message signature input.
+ *
+ * Sender, recipient, timestamp and encrypted payload are encoded with
+ * explicit lengths under a distinct protocol domain. Length prefixes avoid
+ * ambiguous concatenations; including the recipient prevents a valid packet
+ * from being redirected to another user without signature failure. */
 static inline int signed_message(const char *from,const char *to,
                                   const char *stamp,const char *body,
                                   unsigned char *out,size_t cap,size_t *n) {

@@ -1,3 +1,10 @@
+/*
+ * Symmetric encryption and KDF helpers shared by the messaging protocol.
+ *
+ * AES-256-GCM authenticates ciphertext together with associated metadata;
+ * decryption must not expose plaintext until tag verification succeeds.
+ * The older sequential-ratchet helpers below are not the Double Ratchet.
+ */
 #ifndef MESSAGE_CRYPTO_H
 #define MESSAGE_CRYPTO_H
 #include "keyexchange.h"
@@ -6,7 +13,12 @@
 #include <inttypes.h>
 #define AEAD_NONCE 12
 #define AEAD_TAG 16
-/* Sequential-only demonstration ratchet. Not the Signal Double Ratchet. */
+/* Legacy sequential-chain helper retained for compatibility.
+ *
+ * This function is NOT the Double Ratchet: it contains no DH ratchet and no
+ * skipped-message key handling. Stage 8H message traffic uses DRState and the
+ * dr_* functions in double_ratchet.h instead. Do not accidentally replace
+ * Double Ratchet processing with this simpler KDF when refactoring the GUI. */
 static inline int ratchet_kdf(const unsigned char key[32],const char *label,unsigned char out[32]) {
  EVP_PKEY_CTX *c=EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF,NULL);
  size_t n=32;
@@ -24,7 +36,12 @@ static inline int ratchet_init(const unsigned char session[32],const char *me,co
  if(ok){memcpy(send,!strcmp(me,"alice")?a:b,32);memcpy(recv,!strcmp(me,"alice")?b:a,32);}
  OPENSSL_cleanse(a,32);OPENSSL_cleanse(b,32);(void)peer;return ok;
 }
-/* Authentication binds sender, recipient, timestamp, counter and ciphertext. */
+/* AES-256-GCM authenticated encryption/decryption helper.
+ *
+ * The supplied 32-byte key, 12-byte nonce and associated data are inputs to
+ * OpenSSL's AEAD interface. The caller must provide unique-enough nonces and
+ * must not use plaintext from a failed authentication. Stage 8H builds its
+ * message-associated data in the Double Ratchet layer. */
 static inline int aead_crypt(int enc,const unsigned char key[32],const unsigned char nonce[12],
  const unsigned char *aad,size_t aadlen,const unsigned char *in,size_t len,
  unsigned char *out,unsigned char tag[16]) {

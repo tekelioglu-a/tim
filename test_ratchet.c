@@ -1,3 +1,9 @@
+/*
+ * Double Ratchet regression tests.
+ *
+ * Exercise the ratchet with controlled packets; these tests are useful for
+ * detecting regressions but are not a substitute for cryptographic review.
+ */
 #include "double_ratchet.h"
 #include <stdio.h>
 #include <string.h>

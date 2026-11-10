@@ -6,3 +6,4 @@ gcc -Wall -Wextra -Wpedantic -Werror -O2 client.c -o client -lssl -lcrypto
 gcc -Wall -Wextra -Wpedantic -Werror -O2 test_ratchet.c -o test_ratchet -lssl -lcrypto
 ./test_ratchet
 python3 test_network.py
+python3 test_restart.py

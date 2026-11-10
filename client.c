@@ -1,3 +1,15 @@
+/*
+ * TIM terminal client (Stage 8H).
+ *
+ * Responsibilities: TLS transport, authenticated peer key exchange,
+ * Double Ratchet message processing, volatile delivery receipts, and
+ * terminal input/output. The relay never receives decrypted message text.
+ *
+ * Security boundary: the client must verify signatures and AEAD tags before
+ * displaying peer content or acknowledging receipt. State is RAM-only;
+ * delivery acknowledgements do not imply durable storage by the recipient.
+ * The current source is a CLI implementation, not a reusable GUI API.
+ */
 #define _POSIX_C_SOURCE 200809L
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -33,6 +45,7 @@ static int saved_tty_valid=0;
 static void restore_tty(void){if(saved_tty_valid)tcsetattr(STDIN_FILENO,TCSANOW,&saved_tty);}
 static void tty_signal(int sig){restore_tty();signal(sig,SIG_DFL);raise(sig);}
 
+/* Write a complete newline-delimited protocol frame over TLS. */
 static int send_line(SSL *ssl,const char *line) {
     size_t len=strlen(line),off=0;
     while (off<len) {
@@ -42,6 +55,7 @@ static int send_line(SSL *ssl,const char *line) {
     }
     return 0;
 }
+/* Resolve and connect to the configured relay TCP port. */
 static int connect_host(const char *host) {
     struct addrinfo hints={0},*res=NULL,*p;
     hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
@@ -61,6 +75,18 @@ static int timestamp(char *buf,size_t size) {
     time_t t=time(NULL); struct tm tm;
     return gmtime_r(&t,&tm) && strftime(buf,size,"%Y-%m-%dT%H:%M:%SZ",&tm)>0 ? 0:-1;
 }
+/* Delivery state and ownership
+ * ----------------------------
+ * Receipt.packet contains the exact serialized, already-encrypted wire frame.
+ * Retries MUST send these bytes again: encrypting the same logical message a
+ * second time would advance the sending ratchet and create a distinct packet.
+ * The random 128-bit id is inside the authenticated ciphertext and correlates
+ * the recipient's encrypted ACK with the sender's outstanding entry. It is
+ * neither a ratchet counter nor a server-assigned delivery guarantee.
+ *
+ * KeyState also owns handshake state, a single active peer ratchet, plaintext
+ * messages waiting for a handshake, and a bounded duplicate-detection cache.
+ * All these structures are volatile; restarting loses pending deliveries. */
 typedef struct {
  unsigned char id[16];
  char packet[3200];
@@ -81,7 +107,9 @@ typedef struct {
  unsigned char seen[128][16];
  unsigned int seen_count;
  unsigned char seen_packet[128][32];
+ time_t last_reset_sent; /* Rate-limit signed recovery requests after restart. */
 } KeyState;
+/* Sign and transmit one authenticated key-exchange frame. */
 static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  const char *kind,const char *sid,const char *initpub,const char *resppub) {
  unsigned char t[512],sig[SIG_LEN];size_t n=0;
@@ -92,6 +120,7 @@ static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  int z=snprintf(line,sizeof(line),"KEY %s %s %s %s %s %s\n",to,kind,sid,initpub,resppub,hex);
  return z>0 && (size_t)z<sizeof(line) && send_line(ssl,line)==0;
 }
+/* Encrypt, sign, serialize, and transmit an E2EE packet. */
 static int send_encrypted(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  DRState *ratchet,const unsigned char *body,size_t blen,char *packet_out) {
  if(blen>1200 || !ratchet->has_cks)return 0;
@@ -109,15 +138,26 @@ static int send_encrypted(SSL *ssl,EVP_PKEY *identity,const char *from,const cha
  return send_line(ssl,out)==0;
 }
 static void idhex(const unsigned char id[16],char out[33]){tohex(id,16,out);}
+/* Clear both the receipt metadata and its cached ciphertext. */
 static void receipt_clear(Receipt *r){
  OPENSSL_cleanse(r,sizeof(*r));
 }
+/* Reserve a receipt slot; no disk-backed retry queue exists. */
 static int receipt_add(KeyState *ks,const unsigned char id[16],const char *packet){
  for(int i=0;i<RECEIPT_MAX;i++)if(!ks->receipts[i].active){
   Receipt *r=&ks->receipts[i];receipt_clear(r);memcpy(r->id,id,16);strcpy(r->packet,packet);
   r->last_sent=time(NULL);r->first_sent=r->last_sent;r->attempts=1;r->active=1;return 1;
  }return 0;
 }
+/* Submit one user message to an established E2EE session.
+ *
+ * Wire plaintext before encryption: [type=3:1 byte][random ID:16 bytes]
+ * [UTF-8 text:remaining bytes]. The receipt ID is authenticated because the
+ * whole envelope is protected by the Double Ratchet AEAD. A receipt slot is
+ * reserved conceptually before encryption so we do not knowingly send a
+ * message that cannot be tracked. The ciphertext is cached only for retries.
+ * The terminal's eight hex digits are a shortened display label; matching
+ * uses all 16 ID bytes. A queued marker means locally submitted, NOT read. */
 static int send_user(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *ks,const char *msg){
  size_t len=strlen(msg);if(len>USER_MESSAGE_MAX)return 0;
  int free_slot=0;for(int i=0;i<RECEIPT_MAX;i++)if(!ks->receipts[i].active)free_slot=1;
@@ -131,6 +171,13 @@ static int send_user(SSL *ssl,EVP_PKEY *identity,const char *user,const char *pe
  if(!receipt_add(ks,id,packet)){OPENSSL_cleanse(id,sizeof(id));return 0;}
  idhex(id,shortid);if(debug_mode)printf("[QUEUED] %.8s\n> ",shortid);else printf("|* |  %.8s\n> ",shortid);fflush(stdout);OPENSSL_cleanse(id,sizeof(id));return 1;
 }
+/* Mark a message delivered after processing an authenticated E2EE ACK.
+ *
+ * The caller reaches this function only after verifying the peer's signature
+ * and AEAD tag and decoding an envelope with type=4 and a 16-byte ID. An ACK
+ * establishes that the peer's application decrypted the corresponding message;
+ * it does not establish that a human read it or that it was saved to disk.
+ * A duplicate or unknown ID is ignored without freeing unrelated entries. */
 static void receipt_ack(KeyState *ks,const unsigned char id[16]){
  for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active && memcmp(ks->receipts[i].id,id,16)==0){
   char hex[33];idhex(id,hex);if(debug_mode)printf("[DELIVERED] %.8s\n> ",hex);else printf("|**|  %.8s\n> ",hex);fflush(stdout);
@@ -138,6 +185,7 @@ static void receipt_ack(KeyState *ks,const unsigned char id[16]){
  }
  DEBUG("[DEBUG] Unknown or duplicate delivery acknowledgement\n");
 }
+/* Detect duplicate delivery IDs within the bounded in-memory window. */
 static int already_seen(KeyState *ks,const unsigned char id[16]){
  for(unsigned int i=0;i<ks->seen_count;i++)if(!memcmp(ks->seen[i],id,16))return 1;
  return 0;
@@ -149,6 +197,14 @@ static void remember_seen(KeyState *ks,const unsigned char id[16],const unsigned
  else {memmove(ks->seen,ks->seen+1,127*16);memcpy(ks->seen[127],id,16);
  memmove(ks->seen_packet,ks->seen_packet+1,127*32);memcpy(ks->seen_packet[127],hash,32);}
 }
+/* Time-bounded delivery retries.
+ *
+ * Every active receipt is checked against its first transmission time. Once
+ * the three-hour window expires it is reported unconfirmed and erased. Before
+ * expiry, the exact cached ciphertext frame is retransmitted no more often
+ * than every RETRY_SECONDS. This avoids consuming another message key and
+ * avoids changing the recipient's expected ratchet sequence on a retry.
+ * Successful relay transmission is not an E2EE delivery acknowledgement. */
 static void retry_receipts(SSL *ssl,KeyState *ks){
  time_t now=time(NULL);
  for(int i=0;i<RECEIPT_MAX;i++){
@@ -160,8 +216,14 @@ static void retry_receipts(SSL *ssl,KeyState *ks){
   r->last_sent=now;r->attempts++;DEBUG("[DEBUG] Retried encrypted packet %.8s attempt %d\n",hex,r->attempts);
  }
 }
-/* An offline relay response invalidates the volatile peer session.  We do
- * not re-encrypt undelivered messages: each is explicitly UNCONFIRMED. */
+/* Handle an explicit peer-offline response from the relay.
+ *
+ * In this implementation a peer restart loses its in-memory ratchet state.
+ * Continuing the previous session would leave the two endpoints out of sync.
+ * We therefore fail outstanding receipts, erase queued plaintext, free the
+ * ratchet and handshake state, and require a fresh authenticated handshake
+ * for the next user message. We do NOT silently replay old plaintext into a
+ * new session: the user must decide whether to resend unconfirmed content. */
 static void peer_offline(KeyState *ks){
  for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active){
   char hex[33];idhex(ks->receipts[i].id,hex);
@@ -179,6 +241,7 @@ static void peer_offline(KeyState *ks){
  ks->seen_count=0;
  DEBUG("[DEBUG /key] Peer unavailable; old session discarded. Next message initiates new authenticated session.\n");
 }
+/* Drain plaintext queued during handshake; wipe consumed queue slots. */
 static void flush_queue(SSL *ssl,EVP_PKEY *identity,const char *user,KeyState *ks){
  if(!ks->established || !ks->ratchet.has_cks)return;
  int done=0;
@@ -191,10 +254,43 @@ static void flush_queue(SSL *ssl,EVP_PKEY *identity,const char *user,KeyState *k
  }
  if(done){for(int i=done;i<ks->qcount;i++)memmove(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;for(int i=ks->qcount;i<QUEUE_MAX;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));}
 }
+/* Queue a bounded plaintext message until the session is established. */
 static int queue_message(KeyState *ks,const char *body){
  if(strlen(body)>USER_MESSAGE_MAX || ks->qcount>=QUEUE_MAX)return 0;
  strcpy(ks->queued[ks->qcount++],body);return 1;
 }
+/* Authenticate and advance the peer key-exchange state machine.
+ *
+ * KEYFROM frames arrive via the relay but are not trusted merely because TLS
+ * protects the relay connection. The peer's Ed25519 signature is checked over
+ * a transcript binding message kind, sender, recipient, session ID, and DH
+ * public keys. INIT creates responder state; REPLY must match our outstanding
+ * session ID and initiator public key. A derived X25519 secret is fed to the
+ * session KDF and then the Double Ratchet initializer.
+ *
+ * The initiator sends a one-byte encrypted bootstrap control message so the
+ * responder can derive its first receiving and sending chains. Application
+ * messages queued during negotiation are flushed only when usable chains
+ * exist. A verified identity key does not itself prove the peer device is
+ * uncompromised; distribution/trust of the .pub files is external to TIM. */
+static int key_initiate(SSL *,EVP_PKEY *,const char *,const char *,KeyState *,int);
+
+/* A signed recovery request contains fresh random values and no plaintext.
+ * It is a hint, not authorization to discard a working session. */
+static void request_reset(SSL *ssl,EVP_PKEY *identity,const char *user,
+                          const char *peer,KeyState *ks){
+ time_t now=time(NULL);
+ if(ks->last_reset_sent && now-ks->last_reset_sent<5)return;
+ unsigned char nonce[48];char sid[33],pub[65];
+ if(RAND_bytes(nonce,sizeof(nonce))!=1)return;
+ tohex(nonce,16,sid);tohex(nonce+16,32,pub);
+ OPENSSL_cleanse(nonce,sizeof(nonce));
+ if(key_send(ssl,identity,user,peer,"RESET",sid,pub,"-")){
+  ks->last_reset_sent=now;
+  DEBUG("[DEBUG /key] Requested authenticated session recovery from %s\n",peer);
+ }
+}
+
 static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
  EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *state) {
  char *parts[6],*save=NULL;
@@ -203,14 +299,38 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
  char *from=parts[0],*kind=parts[1],*sid=parts[2],*initpub=parts[3],*resppub=parts[4],*sighex=parts[5];
  EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:!strcmp(from,"bob")?bob_pub:NULL;
  unsigned char sig[SIG_LEN],sidbytes[SID_LEN],initbytes[DH_LEN],replybytes[DH_LEN],transcript[512];size_t n=0;
- if(!peer || !strcmp(from,user) || (strcmp(kind,"INIT") && strcmp(kind,"REPLY")) ||
+ if(!peer || !strcmp(from,user) || (strcmp(kind,"INIT") && strcmp(kind,"REPLY") && strcmp(kind,"RESET")) ||
     !fromhex(sid,sidbytes,SID_LEN) || !fromhex(initpub,initbytes,DH_LEN) ||
     (!strcmp(kind,"REPLY")?!fromhex(resppub,replybytes,DH_LEN):strcmp(resppub,"-")!=0) ||
     !fromhex(sighex,sig,SIG_LEN) ||
     !dh_transcript(kind,from,user,sid,initpub,resppub,transcript,sizeof(transcript),&n) ||
     !ed_verify(peer,transcript,n,sig)) {puts("[REJECTED unauthenticated KEY]");return;}
+ if(!strcmp(kind,"RESET")){
+    /* If our fresh INIT met an old session on the peer, it responds with
+     * RESET. Withdraw the unanswered INIT and request that peer initiate
+     * instead. No active ratchet is destroyed by this negotiation. */
+    if(state->pending && !state->established && !strcmp(state->pending_peer,from)){
+      EVP_PKEY_free(state->pending);state->pending=NULL;
+      state->pending_peer[0]=state->sid[0]=state->initpub[0]=0;
+      request_reset(ssl,identity,user,from,state);
+      return;
+    }
+    /* Verification above authenticates the request, but a replayed RESET
+     * must never erase a live ratchet. Keep the old session until the peer
+     * proves possession of a fresh INIT's X25519 secret with its REPLY. */
+    if(state->established && !strcmp(state->established_peer,from) && !state->pending){
+      if(!key_initiate(ssl,identity,user,from,state,1))
+        DEBUG("[DEBUG /key] Could not start recovery handshake\n");
+    }
+    return;
+ }
  if(!strcmp(kind,"INIT")){
-    if(state->established || state->pending){puts("[REJECTED active/pending session]");return;}
+    if(state->established || state->pending){
+      if(state->established && !strcmp(state->established_peer,from))
+        request_reset(ssl,identity,user,from,state);
+      else puts("[REJECTED active/pending session]");
+      return;
+    }
     EVP_PKEY *mine=dh_generate();unsigned char mypub[DH_LEN],secret[DH_LEN],key[DH_LEN];char myhex[DH_LEN*2+1];
     if(!mine || !dh_public(mine,mypub)){EVP_PKEY_free(mine);return;}
     tohex(mypub,DH_LEN,myhex);
@@ -220,6 +340,7 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
     OPENSSL_cleanse(secret,32);OPENSSL_cleanse(key,32);EVP_PKEY_free(mine);
     if(!ok){dr_free(&state->ratchet);puts("[KEY exchange failed]");return;}
     snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
+    snprintf(state->sid,sizeof(state->sid),"%s",sid);
     state->established=1;
     DEBUG("[DEBUG /key] Session established with %s (responder); awaiting automatic ratchet bootstrap\n",from);
  } else {
@@ -227,6 +348,14 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
       puts("[REJECTED unexpected KEY reply]");return;}
     unsigned char secret[32],key[32];
     int ok=dh_secret(state->pending,replybytes,secret) && dh_derive_key(secret,user,from,sid,initpub,resppub,key);
+    if(ok && state->established){
+      /* The peer proved a fresh shared secret. Only NOW invalidate old
+       * delivery receipts and erase the obsolete session. */
+      EVP_PKEY *pending=state->pending;
+      state->pending=NULL;
+      peer_offline(state);
+      state->pending=pending;
+    }
     if(ok)ok=dr_init_initiator(&state->ratchet,key,replybytes);
     OPENSSL_cleanse(secret,32);OPENSSL_cleanse(key,32);
     EVP_PKEY_free(state->pending);state->pending=NULL;
@@ -244,8 +373,9 @@ static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
     flush_queue(ssl,identity,user,state);
  }
 }
-static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *state) {
- if((strcmp(peer,"alice") && strcmp(peer,"bob")) || !strcmp(peer,user) || state->pending || state->established)return 0;
+/* Start an authenticated handshake for a peer without a live session. */
+static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *state,int recovery) {
+ if((strcmp(peer,"alice") && strcmp(peer,"bob")) || !strcmp(peer,user) || state->pending || (state->established && !recovery))return 0;
  EVP_PKEY *mine=dh_generate();unsigned char pub[32],sid[16];
  if(!mine || !dh_public(mine,pub) || RAND_bytes(sid,16)!=1){EVP_PKEY_free(mine);return 0;}
  char pubhex[65],sidhex[33];tohex(pub,32,pubhex);tohex(sid,16,sidhex);
@@ -253,6 +383,22 @@ static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char 
  state->pending=mine;strcpy(state->pending_peer,peer);strcpy(state->sid,sidhex);strcpy(state->initpub,pubhex);
  DEBUG("[DEBUG /key] Sent authenticated X25519 initialization to %s\n",peer);return 1;
 }
+/* Receive-side trust boundary: nothing from a FROM frame is displayable
+ * until both the Ed25519 envelope signature and the Double Ratchet AEAD tag
+ * have been verified. The signature binds sender, recipient, timestamp, and
+ * serialized ciphertext; the AEAD also authenticates ratchet header metadata.
+ *
+ * After decryption the first byte selects a control envelope:
+ *   1  ratchet bootstrap (internal; never shown to the user)
+ *   3  user message + 16-byte receipt ID + text
+ *   4  delivery acknowledgement + 16-byte receipt ID
+ *
+ * The receiver sends an encrypted ACK for a successfully authenticated type-3
+ * message, suppresses duplicates, rejects terminal control characters, and
+ * wipes plaintext on every path through cleanup_plain. The ciphertext hash
+ * cache permits recognizing a retransmitted *identical* encrypted packet even
+ * after the ratchet has advanced and normal decryption would reject replay.
+ * It is important that a replayed packet never be displayed a second time. */
 static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *user,
                              EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
  if(!strcmp(line,"ERR User not connected") || !strcmp(line,"ERR Peer not connected")){
@@ -273,7 +419,11 @@ static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *
     printf("[REJECTED invalid signature from %s]\n> ",from);return;
  }
  if(strncmp(body,"D8:",3)!=0){puts("[REJECTED unencrypted message]");return;}
- if(!ks->established || strcmp(ks->established_peer,from)){puts("[REJECTED no active session]");return;}
+ if(!ks->established || strcmp(ks->established_peer,from)){
+   puts("[REJECTED no active session]");
+   request_reset(ssl,identity,user,from,ks);
+   return;
+ }
  char *pieces[4],*save=NULL;
  for(int i=0;i<4;i++)pieces[i]=strtok_r(i?NULL:body+3,":",&save);
  if(!pieces[3] || strtok_r(NULL,":",&save)){puts("[REJECTED malformed ciphertext]");return;}
@@ -504,7 +654,7 @@ int main(int argc,char **argv) {
                 if(!queue_message(&ks,body)){
                     fprintf(stderr,"[ERROR] Message exceeds 1183 bytes or pending queue is full\n> "); {OPENSSL_cleanse(command,sizeof(command));continue;}
                 }
-                if(!ks.established && !ks.pending && !key_initiate(ssl,identity,argv[2],command,&ks)){
+                if(!ks.established && !ks.pending && !key_initiate(ssl,identity,argv[2],command,&ks,0)){
                     fprintf(stderr,"[ERROR] Automatic key exchange failed\n> ");
                 }else{
                     DEBUG("[DEBUG] Queued message for %s (pending=%d)\n",command,ks.qcount);
