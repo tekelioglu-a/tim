@@ -6,160 +6,233 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
+#include <fcntl.h>
 #include <pthread.h>
-#include <signal.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
+#include <netdb.h>
 
-#define PORT       5555
+#define PORT       "5555"
 #define MAX_LINE   4096
-#define MAX_USER   32
-#define BACKLOG    20
+#define MAX_USER   64
+#define MAX_OUTPUT (MAX_LINE + MAX_USER + 128)
+
+typedef struct OutMessage {
+    struct OutMessage *next;
+    size_t length;
+    size_t sent;
+    char data[];
+} OutMessage;
 
 typedef struct Client {
     int fd;
-    int logged_in;
+    int wake_pipe[2];
+
+    int authenticated;
     char username[MAX_USER];
+
+    pthread_mutex_t queue_mutex;
+    OutMessage *queue_head;
+    OutMessage *queue_tail;
+
     struct Client *next;
 } Client;
 
 static Client *clients = NULL;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Initial hard-coded accounts */
-static const struct {
-    const char *username;
-    const char *password;
-} accounts[] = {
-    {"alice", "alice"},
-    {"bob",   "bob"}
-};
+/* --------------------------------------------------------- */
+/* Test authentication                                       */
+/* --------------------------------------------------------- */
 
-#define ACCOUNT_COUNT (sizeof(accounts) / sizeof(accounts[0]))
-
-static int authenticate(const char *user, const char *pass)
+static int authenticate(const char *username, const char *password)
 {
-    for (size_t i = 0; i < ACCOUNT_COUNT; i++) {
-        if (strcmp(user, accounts[i].username) == 0 &&
-            strcmp(pass, accounts[i].password) == 0)
-            return 1;
-    }
-    return 0;
-}
+    if (strcmp(username, "alice") == 0 &&
+        strcmp(password, "alice") == 0)
+        return 1;
 
-/* Send all bytes, handling partial writes */
-static int send_all(int fd, const char *buf, size_t len)
-{
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-
-        if (n == 0)
-            return -1;
-
-        buf += n;
-        len -= (size_t)n;
-    }
+    if (strcmp(username, "bob") == 0 &&
+        strcmp(password, "bob") == 0)
+        return 1;
 
     return 0;
 }
 
-static int send_line(int fd, const char *line)
+/* --------------------------------------------------------- */
+/* Non-blocking file descriptors                             */
+/* --------------------------------------------------------- */
+
+static int set_nonblocking(int fd)
 {
-    return send_all(fd, line, strlen(line));
+    int flags = fcntl(fd, F_GETFL, 0);
+
+    if (flags < 0)
+        return -1;
+
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* Read one newline-terminated message */
-static int recv_line(int fd, char *buf, size_t size)
+/* --------------------------------------------------------- */
+/* Outgoing message queue                                    */
+/* --------------------------------------------------------- */
+
+static int queue_push(Client *client, const char *message)
 {
-    size_t pos = 0;
+    size_t length = strlen(message);
 
-    while (pos < size - 1) {
-        char c;
-        ssize_t n = recv(fd, &c, 1, 0);
+    OutMessage *item = malloc(sizeof(*item) + length);
 
-        if (n == 0)
-            return -1;
+    if (item == NULL)
+        return -1;
 
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
+    item->next = NULL;
+    item->length = length;
+    item->sent = 0;
+    memcpy(item->data, message, length);
 
-        if (c == '\n') {
-            buf[pos] = '\0';
+    pthread_mutex_lock(&client->queue_mutex);
 
-            if (pos > 0 && buf[pos - 1] == '\r')
-                buf[pos - 1] = '\0';
+    if (client->queue_tail != NULL)
+        client->queue_tail->next = item;
+    else
+        client->queue_head = item;
 
+    client->queue_tail = item;
+
+    pthread_mutex_unlock(&client->queue_mutex);
+
+    /*
+     * Wake the connection-owning thread.
+     * EAGAIN is harmless: a full pipe is already readable.
+     */
+    char byte = 'W';
+    ssize_t n = write(client->wake_pipe[1], &byte, 1);
+
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+        errno != EINTR) {
+        /* The queued message remains available to the owner. */
+    }
+
+    return 0;
+}
+
+static OutMessage *queue_pop(Client *client)
+{
+    pthread_mutex_lock(&client->queue_mutex);
+
+    OutMessage *item = client->queue_head;
+
+    if (item != NULL) {
+        client->queue_head = item->next;
+
+        if (client->queue_head == NULL)
+            client->queue_tail = NULL;
+    }
+
+    pthread_mutex_unlock(&client->queue_mutex);
+
+    return item;
+}
+
+static int queue_is_empty(Client *client)
+{
+    pthread_mutex_lock(&client->queue_mutex);
+
+    int empty = (client->queue_head == NULL);
+
+    pthread_mutex_unlock(&client->queue_mutex);
+
+    return empty;
+}
+
+static void drain_wakeup_pipe(int fd)
+{
+    char buffer[128];
+
+    while (read(fd, buffer, sizeof(buffer)) > 0)
+        ;
+}
+
+/* --------------------------------------------------------- */
+/* Timestamp validation                                      */
+/* --------------------------------------------------------- */
+
+static int valid_timestamp(const char *s)
+{
+    if (strlen(s) != 20)
+        return 0;
+
+    if (s[4]  != '-' ||
+        s[7]  != '-' ||
+        s[10] != 'T' ||
+        s[13] != ':' ||
+        s[16] != ':' ||
+        s[19] != 'Z')
+        return 0;
+
+    for (int i = 0; i < 20; i++) {
+        if (i == 4 || i == 7 || i == 10 ||
+            i == 13 || i == 16 || i == 19)
+            continue;
+
+        if (!isdigit((unsigned char)s[i]))
             return 0;
-        }
-
-        if (c == '\0')
-            return -1;
-
-        buf[pos++] = c;
     }
 
-    return -1; /* Line too long */
+    return 1;
 }
 
-static void add_client(Client *c)
+/* --------------------------------------------------------- */
+/* Client list                                               */
+/* --------------------------------------------------------- */
+
+static void remove_client(Client *client)
 {
     pthread_mutex_lock(&clients_mutex);
 
-    c->next = clients;
-    clients = c;
+    Client **current = &clients;
+
+    while (*current != NULL) {
+        if (*current == client) {
+            *current = client->next;
+            break;
+        }
+
+        current = &(*current)->next;
+    }
 
     pthread_mutex_unlock(&clients_mutex);
 }
 
-static void remove_client(Client *c)
-{
-    pthread_mutex_lock(&clients_mutex);
+/* --------------------------------------------------------- */
+/* Message forwarding                                        */
+/* --------------------------------------------------------- */
 
-    Client **p = &clients;
-
-    while (*p && *p != c)
-        p = &(*p)->next;
-
-    if (*p == c)
-        *p = c->next;
-
-    pthread_mutex_unlock(&clients_mutex);
-}
-
-/* Forward a message to all connected sessions of recipient */
 static int forward_message(const char *sender,
                            const char *recipient,
                            const char *timestamp,
                            const char *body)
 {
-    char output[MAX_LINE + MAX_USER + 16];
+    char output[MAX_OUTPUT];
 
-    int len = snprintf(output, sizeof(output),
-                   "FROM %s %s %s\n",
-                   sender, timestamp, body);
+    int n = snprintf(output, sizeof(output),
+                     "FROM %s %s %s\n",
+                     sender, timestamp, body);
 
-    if (len < 0 || (size_t)len >= sizeof(output))
-        return -1;
+    if (n < 0 || (size_t)n >= sizeof(output))
+        return 0;
 
     int delivered = 0;
 
     pthread_mutex_lock(&clients_mutex);
 
-    for (Client *c = clients; c; c = c->next) {
-        if (c->logged_in &&
+    for (Client *c = clients; c != NULL; c = c->next) {
+        if (c->authenticated &&
             strcmp(c->username, recipient) == 0) {
 
-            if (send_all(c->fd, output, (size_t)len) == 0)
+            if (queue_push(c, output) == 0)
                 delivered++;
         }
     }
@@ -169,94 +242,83 @@ static int forward_message(const char *sender,
     return delivered;
 }
 
-static void *client_thread(void *arg)
+/* --------------------------------------------------------- */
+/* Process one complete client command                       */
+/* --------------------------------------------------------- */
+
+/* Returns 1 when the client requests QUIT. */
+static int process_line(Client *client, char *line)
 {
-    Client *c = arg;
-    char line[MAX_LINE];
-    char username[MAX_USER];
-    char password[64];
+    if (strncmp(line, "LOGIN ", 6) == 0) {
+        char username[MAX_USER];
+        char password[MAX_USER];
+        char extra;
 
-    printf("Connection established: fd=%d\n", c->fd);
+        if (client->authenticated) {
+            queue_push(client, "ERR Already logged in\n");
+            return 0;
+        }
 
-    /* First command must be LOGIN */
-    if (recv_line(c->fd, line, sizeof(line)) < 0)
-        goto cleanup;
+        int fields = sscanf(line + 6, "%63s %63s %c",
+                            username, password, &extra);
 
-    char extra;
+        if (fields != 2) {
+            queue_push(client, "ERR Invalid login format\n");
+            return 0;
+        }
 
-    if (sscanf(line, "LOGIN %31s %63s %c",
-               username, password, &extra) != 2 ||
-        !authenticate(username, password)) {
+        if (!authenticate(username, password)) {
+            queue_push(client, "ERR Authentication failed\n");
+            return 0;
+        }
 
-        send_line(c->fd, "ERR Authentication failed\n");
-        goto cleanup;
+        pthread_mutex_lock(&clients_mutex);
+
+        client->authenticated = 1;
+        snprintf(client->username, sizeof(client->username),
+                 "%s", username);
+
+        pthread_mutex_unlock(&clients_mutex);
+
+        char response[MAX_USER + 64];
+
+        snprintf(response, sizeof(response),
+                 "OK Logged in as %s\n", username);
+
+        queue_push(client, response);
+
+        printf("User logged in: %s (fd=%d)\n",
+               username, client->fd);
+
+        return 0;
     }
 
-    strncpy(c->username, username, sizeof(c->username) - 1);
-    c->username[sizeof(c->username) - 1] = '\0';
-    c->logged_in = 1;
+    if (strcmp(line, "QUIT") == 0) {
+        queue_push(client, "OK Goodbye\n");
+        return 1;
+    }
 
-    add_client(c);
-
-    char response[128];
-
-    snprintf(response, sizeof(response),
-             "OK Logged in as %s\n", c->username);
-
-    if (send_line(c->fd, response) < 0)
-        goto cleanup;
-
-    printf("User logged in: %s\n", c->username);
-
-    /* Main message loop */
-    while (recv_line(c->fd, line, sizeof(line)) == 0) {
-
-        if (strcmp(line, "QUIT") == 0)
-            break;
-
-        if (strncmp(line, "MSG ", 4) != 0) {
-            send_line(c->fd, "ERR Invalid command\n");
-            continue;
+    if (strncmp(line, "MSG ", 4) == 0) {
+        if (!client->authenticated) {
+            queue_push(client, "ERR Please log in first\n");
+            return 0;
         }
 
         char *recipient = line + 4;
-		char *timestamp = strchr(recipient, ' ');
+        char *timestamp = strchr(recipient, ' ');
 
-		if (!timestamp) {
-			send_line(c->fd, "ERR Missing timestamp\n");
-			continue;
-		}
+        if (timestamp == NULL) {
+            queue_push(client, "ERR Missing timestamp\n");
+            return 0;
+        }
 
-		*timestamp++ = '\0';
+        *timestamp++ = '\0';
 
-		char *body = strchr(timestamp, ' ');
+        char *body = strchr(timestamp, ' ');
 
-		if (!body) {
-			send_line(c->fd, "ERR Missing message body\n");
-			continue;
-		}
-
-		*body++ = '\0';
-
-		while (*body == ' ')
-			body++;
-
-		if (!*recipient || !*timestamp || !*body ||
-			strlen(recipient) >= MAX_USER ||
-			strlen(timestamp) != 20) {
-			send_line(c->fd, "ERR Invalid message\n");
-			continue;
-		}
-
-		int delivered = forward_message(
-			c->username, recipient, timestamp, body);
-			
-		
-        char *body = strchr(recipient, ' ');
-
-        if (!body) {
-            send_line(c->fd, "ERR Missing message body\n");
-            continue;
+        if (body == NULL) {
+            queue_push(client, "ERR Missing message body\n");
+            return 0;
         }
 
         *body++ = '\0';
@@ -264,75 +326,301 @@ static void *client_thread(void *arg)
         while (*body == ' ')
             body++;
 
-        if (!*recipient || !*body ||
-            strlen(recipient) >= MAX_USER) {
-            send_line(c->fd, "ERR Invalid message\n");
-            continue;
+        if (*recipient == '\0' ||
+            strlen(recipient) >= MAX_USER ||
+            !valid_timestamp(timestamp) ||
+            *body == '\0') {
+            queue_push(client, "ERR Invalid message\n");
+            return 0;
         }
 
         int delivered = forward_message(
-            c->username, recipient, body);
+            client->username,
+            recipient,
+            timestamp,
+            body
+        );
 
-        if (delivered > 0) {
-            send_line(c->fd, "SENT\n");
-        } else {
-            send_line(c->fd, "ERR User not connected\n");
+        if (delivered > 0)
+            queue_push(client, "SENT\n");
+        else
+            queue_push(client, "ERR User not connected\n");
+
+        return 0;
+    }
+
+    queue_push(client, "ERR Unknown command\n");
+    return 0;
+}
+
+/* --------------------------------------------------------- */
+/* Connection-owning thread                                  */
+/* --------------------------------------------------------- */
+
+static void *client_thread(void *arg)
+{
+    Client *client = (Client *)arg;
+
+    char input[MAX_LINE];
+    size_t input_used = 0;
+    int input_too_long = 0;
+
+    OutMessage *current = NULL;
+
+    int quit_requested = 0;
+    int disconnected = 0;
+
+    printf("Connection established: fd=%d\n", client->fd);
+
+    for (;;) {
+        if (current == NULL)
+            current = queue_pop(client);
+
+        if (quit_requested && current == NULL &&
+            queue_is_empty(client))
+            break;
+
+        struct pollfd fds[2];
+
+        fds[0].fd = client->fd;
+        fds[0].events = quit_requested ? 0 : POLLIN;
+
+        if (current != NULL || !queue_is_empty(client))
+            fds[0].events |= POLLOUT;
+
+        fds[0].revents = 0;
+
+        fds[1].fd = client->wake_pipe[0];
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
+
+        int result = poll(fds, 2, -1);
+
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+
+            perror("poll");
+            break;
+        }
+
+        if (fds[1].revents & POLLIN)
+            drain_wakeup_pipe(client->wake_pipe[0]);
+
+        /* Read incoming data. */
+        if (!quit_requested &&
+            (fds[0].revents & POLLIN)) {
+
+            char buffer[1024];
+
+            for (;;) {
+                ssize_t n = recv(client->fd, buffer,
+                                 sizeof(buffer), 0);
+
+                if (n == 0) {
+                    disconnected = 1;
+                    break;
+                }
+
+                if (n < 0) {
+                    if (errno == EINTR)
+                        continue;
+
+                    if (errno == EAGAIN ||
+                        errno == EWOULDBLOCK)
+                        break;
+
+                    disconnected = 1;
+                    break;
+                }
+
+                for (ssize_t i = 0; i < n; i++) {
+                    char ch = buffer[i];
+
+                    if (ch == '\n') {
+                        if (!input_too_long) {
+                            input[input_used] = '\0';
+
+                            if (input_used > 0 &&
+                                input[input_used - 1] == '\r')
+                                input[--input_used] = '\0';
+
+                            if (process_line(client, input)) {
+                                quit_requested = 1;
+                                break;
+                            }
+                        } else {
+                            queue_push(client,
+                                       "ERR Line too long\n");
+                        }
+
+                        input_used = 0;
+                        input_too_long = 0;
+
+                        if (quit_requested)
+                            break;
+
+                        continue;
+                    }
+
+                    if (!input_too_long) {
+                        if (input_used + 1 < sizeof(input))
+                            input[input_used++] = ch;
+                        else
+                            input_too_long = 1;
+                    }
+                }
+
+                if (quit_requested || disconnected)
+                    break;
+            }
+        }
+
+        if (disconnected)
+            break;
+
+        /* Write outgoing data. Only this thread writes to this socket. */
+        if (fds[0].revents & POLLOUT) {
+            if (current == NULL)
+                current = queue_pop(client);
+
+            if (current != NULL) {
+                ssize_t n = send(
+                    client->fd,
+                    current->data + current->sent,
+                    current->length - current->sent,
+                    MSG_NOSIGNAL
+                );
+
+                if (n > 0) {
+                    current->sent += (size_t)n;
+
+                    if (current->sent == current->length) {
+                        free(current);
+                        current = NULL;
+                    }
+                } else if (n < 0 &&
+                           errno != EINTR &&
+                           errno != EAGAIN &&
+                           errno != EWOULDBLOCK) {
+                    disconnected = 1;
+                    break;
+                } else if (n == 0) {
+                    disconnected = 1;
+                    break;
+                }
+            }
+        }
+
+        if (fds[0].revents & (POLLERR | POLLNVAL)) {
+            disconnected = 1;
+            break;
+        }
+
+        if ((fds[0].revents & POLLHUP) &&
+            !(fds[0].revents & POLLIN)) {
+            disconnected = 1;
+            break;
         }
     }
 
-cleanup:
-    if (c->logged_in) {
-        printf("User disconnected: %s\n", c->username);
-        remove_client(c);
+    free(current);
+
+    remove_client(client);
+
+    close(client->fd);
+    close(client->wake_pipe[0]);
+    close(client->wake_pipe[1]);
+
+    pthread_mutex_lock(&client->queue_mutex);
+
+    OutMessage *item = client->queue_head;
+
+    while (item != NULL) {
+        OutMessage *next = item->next;
+        free(item);
+        item = next;
     }
 
-    close(c->fd);
-    free(c);
+    pthread_mutex_unlock(&client->queue_mutex);
+
+    pthread_mutex_destroy(&client->queue_mutex);
+
+    printf("Connection closed: fd=%d\n", client->fd);
+
+    free(client);
 
     return NULL;
 }
 
+/* --------------------------------------------------------- */
+/* Main server                                               */
+/* --------------------------------------------------------- */
+
 int main(void)
 {
-    signal(SIGPIPE, SIG_IGN);
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    struct addrinfo *rp;
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = -1;
+    int yes = 1;
+
+    memset(&hints, 0, sizeof(hints));
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    int gai = getaddrinfo(NULL, PORT, &hints, &results);
+
+    if (gai != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gai));
+        return EXIT_FAILURE;
+    }
+
+    for (rp = results; rp != NULL; rp = rp->ai_next) {
+        server_fd = socket(rp->ai_family,
+                           rp->ai_socktype,
+                           rp->ai_protocol);
+
+        if (server_fd < 0)
+            continue;
+
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                   &yes, sizeof(yes));
+
+        if (bind(server_fd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;
+
+        close(server_fd);
+        server_fd = -1;
+    }
+
+    freeaddrinfo(results);
 
     if (server_fd < 0) {
-        perror("socket");
-        return EXIT_FAILURE;
-    }
-
-    int opt = 1;
-
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
-               &opt, sizeof(opt));
-
-    struct sockaddr_in address = {0};
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&address,
-             sizeof(address)) < 0) {
         perror("bind");
-        close(server_fd);
         return EXIT_FAILURE;
     }
 
-    if (listen(server_fd, BACKLOG) < 0) {
+    if (listen(server_fd, 32) < 0) {
         perror("listen");
         close(server_fd);
         return EXIT_FAILURE;
     }
 
-    printf("Messaging server listening on port %d\n", PORT);
+    printf("Server listening on port %s\n", PORT);
 
     for (;;) {
-        int fd = accept(server_fd, NULL, NULL);
+        struct sockaddr_storage address;
+        socklen_t address_length = sizeof(address);
 
-        if (fd < 0) {
+        int client_fd = accept(server_fd,
+                               (struct sockaddr *)&address,
+                               &address_length);
+
+        if (client_fd < 0) {
             if (errno == EINTR)
                 continue;
 
@@ -340,27 +628,72 @@ int main(void)
             continue;
         }
 
-        Client *c = calloc(1, sizeof(*c));
+        Client *client = calloc(1, sizeof(*client));
 
-        if (!c) {
-            close(fd);
+        if (client == NULL) {
+            perror("calloc");
+            close(client_fd);
             continue;
         }
 
-        c->fd = fd;
+        client->fd = client_fd;
 
-        pthread_t tid;
-
-        if (pthread_create(&tid, NULL, client_thread, c) != 0) {
-            close(fd);
-            free(c);
+        if (pthread_mutex_init(&client->queue_mutex, NULL) != 0) {
+            fprintf(stderr, "Could not initialise client mutex\n");
+            close(client_fd);
+            free(client);
             continue;
         }
 
-        pthread_detach(tid);
+        if (pipe(client->wake_pipe) < 0) {
+            perror("pipe");
+            pthread_mutex_destroy(&client->queue_mutex);
+            close(client_fd);
+            free(client);
+            continue;
+        }
+
+        if (set_nonblocking(client->wake_pipe[0]) < 0 ||
+            set_nonblocking(client->wake_pipe[1]) < 0 ||
+            set_nonblocking(client->fd) < 0) {
+            perror("fcntl");
+            close(client->wake_pipe[0]);
+            close(client->wake_pipe[1]);
+            pthread_mutex_destroy(&client->queue_mutex);
+            close(client_fd);
+            free(client);
+            continue;
+        }
+
+        pthread_mutex_lock(&clients_mutex);
+
+        client->next = clients;
+        clients = client;
+
+        pthread_mutex_unlock(&clients_mutex);
+
+        pthread_t thread;
+
+        int err = pthread_create(&thread, NULL,
+                                 client_thread, client);
+
+        if (err != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(err));
+
+            remove_client(client);
+            close(client->fd);
+            close(client->wake_pipe[0]);
+            close(client->wake_pipe[1]);
+            pthread_mutex_destroy(&client->queue_mutex);
+            free(client);
+            continue;
+        }
+
+        pthread_detach(thread);
     }
 
     close(server_fd);
+
     return EXIT_SUCCESS;
 }
 
