@@ -84,3 +84,22 @@ When the relay reports `ERR User not connected` or `ERR Peer not connected`, the
 Outstanding messages are retried every 60 seconds for up to 3 hours from the initial transmission while both clients remain connected. If no end-to-end acknowledgement arrives by then, the sender reports `[UNCONFIRMED]` and erases the receipt. If the relay explicitly reports that the recipient is offline, outstanding receipts are marked unconfirmed immediately, as in Stage 8H. The queue has 32 slots and is memory-only; closing the client discards it. These changes do not add offline message storage or guarantee delivery. The three-hour expiry path has not been tested with a real three-hour wait.
 
 The bracketed `[E2EE VERIFIED ...]` prefix is local terminal output, not part of the encrypted plaintext. The protocol timestamp is signed and included in authenticated message processing; it is not a nonce.
+
+### Compact delivery display (normal mode)
+
+In normal mode, successful E2EE verification is silent. Received messages
+show the authenticated sender on the timestamp line and the message text on
+the next line, for example:
+
+```text
+2026-11-10T12:44:46Z [Bob]
+hi
+```
+
+A failed signature/ratchet check still reports a rejection. Sending prints
+`|* |  17db8983` when queued, `|**|  17db8983` on acknowledgement, and
+`|*é|  17db8983` when delivery fails or expires. The eight hexadecimal
+digits identify the same message across status lines. These are separate
+status lines, not in-place rewrites. Use `-d` for detailed receipt and
+verification messages. Debug verification appears on its own line above
+the timestamp and message.

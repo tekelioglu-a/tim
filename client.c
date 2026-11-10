@@ -16,6 +16,7 @@
 #include <limits.h>
 #include <termios.h>
 #include <signal.h>
+#include <ctype.h>
 
 #define PORT "5555"
 #define MAX_LINE 4096
@@ -126,11 +127,11 @@ static int send_user(SSL *ssl,EVP_PKEY *identity,const char *user,const char *pe
  payload[0]=3;memcpy(payload+1,id,16);memcpy(payload+17,msg,len);
  if(!send_encrypted(ssl,identity,user,peer,&ks->ratchet,payload,len+17,packet))return 0;
  if(!receipt_add(ks,id,packet))return 0;
- idhex(id,shortid);printf("[QUEUED] %.8s\n> ",shortid);fflush(stdout);return 1;
+ idhex(id,shortid);if(debug_mode)printf("[QUEUED] %.8s\n> ",shortid);else printf("|* |  %.8s\n> ",shortid);fflush(stdout);return 1;
 }
 static void receipt_ack(KeyState *ks,const unsigned char id[16]){
  for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active && memcmp(ks->receipts[i].id,id,16)==0){
-  char hex[33];idhex(id,hex);printf("[DELIVERED] %.8s\n> ",hex);
+  char hex[33];idhex(id,hex);if(debug_mode)printf("[DELIVERED] %.8s\n> ",hex);else printf("|**|  %.8s\n> ",hex);fflush(stdout);
   receipt_clear(&ks->receipts[i]);return;
  }
  DEBUG("[DEBUG] Unknown or duplicate delivery acknowledgement\n");
@@ -151,7 +152,7 @@ static void retry_receipts(SSL *ssl,KeyState *ks){
  for(int i=0;i<RECEIPT_MAX;i++){
   Receipt *r=&ks->receipts[i];if(!r->active)continue;
   char hex[33];idhex(r->id,hex);
-  if(now-r->first_sent>=DELIVERY_WINDOW_SECONDS){printf("[UNCONFIRMED] %.8s (3-hour acknowledgement window expired)\n> ",hex);receipt_clear(r);continue;}
+  if(now-r->first_sent>=DELIVERY_WINDOW_SECONDS){if(debug_mode)printf("[UNCONFIRMED] %.8s (3-hour acknowledgement window expired)\n> ",hex);else printf("|*é|  %.8s\n> ",hex);fflush(stdout);receipt_clear(r);continue;}
   if(now-r->last_sent<RETRY_SECONDS)continue;
   if(send_line(ssl,r->packet)<0){DEBUG("[DEBUG] Retransmission failed\n");continue;}
   r->last_sent=now;r->attempts++;DEBUG("[DEBUG] Retried encrypted packet %.8s attempt %d\n",hex,r->attempts);
@@ -162,7 +163,7 @@ static void retry_receipts(SSL *ssl,KeyState *ks){
 static void peer_offline(KeyState *ks){
  for(int i=0;i<RECEIPT_MAX;i++)if(ks->receipts[i].active){
   char hex[33];idhex(ks->receipts[i].id,hex);
-  printf("[UNCONFIRMED] %.8s (peer offline)\n> ",hex);
+  if(debug_mode)printf("[UNCONFIRMED] %.8s (peer offline)\n> ",hex);else printf("|*é|  %.8s\n> ",hex);fflush(stdout);
   receipt_clear(&ks->receipts[i]);
  }
  for(int i=0;i<ks->qcount;i++)OPENSSL_cleanse(ks->queued[i],sizeof(ks->queued[i]));
@@ -314,7 +315,8 @@ static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *
  for(size_t j=0;j<clen;j++)if(plain[j]<32 || plain[j]==127){
    OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED control character in message]");return;
  }
- printf("[E2EE VERIFIED %s] %s %s\n> ",from,stamp,plain);
+ if(debug_mode)printf("[E2EE VERIFIED %s]\n",from);
+ printf("%s [%c%s]\n%s\n> ",stamp,(char)toupper((unsigned char)from[0]),from+1,plain);
  OPENSSL_cleanse(plain,sizeof(plain));
 }
 static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *state,

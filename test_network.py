@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local integration smoke test of Stage 8A network E2EE (NOT DH ratchet integration)."""
-import os, pty, select, subprocess, tempfile, time, signal, pathlib, sys
+import os, pty, select, subprocess, tempfile, time, signal, pathlib, sys, re
 ROOT=pathlib.Path(__file__).resolve().parent
 class Terminal:
     def __init__(self,argv,cwd):
@@ -46,11 +46,11 @@ def run(debug=False, initiator="alice"):
             first_name,second_name=('Alice','Bob') if initiator=='alice' else ('Bob','Alice')
             first.send(('bob ' if first is alice else 'alice ')+first_name+'1')
             second.until(first_name+'1')
-            first.until('[DELIVERED]')
+            first.until('[DELIVERED]' if debug else '|**|')
             # The responder can now send without any user-visible ratchet setup.
             second.send(('bob ' if second is alice else 'alice ')+second_name+'1')
             first.until(second_name+'1')
-            second.until('[DELIVERED]')
+            second.until('[DELIVERED]' if debug else '|**|')
             if debug:
                 first.until('[DEBUG /key]')
                 second.until('[DEBUG /rekey]')
@@ -60,11 +60,24 @@ def run(debug=False, initiator="alice"):
             # UTF-8 backspace regression: delete the complete multibyte character.
             # Send ş then i, backspace twice, then hi; peer must see exactly hi.
             os.write(alice.master, 'bob ş'.encode('utf-8') + b'\x7futf8fixed\n')
-            bob.until('[E2EE VERIFIED alice]')
-            bob.until(' utf8fixed')
+            
+            if debug: bob.until('[E2EE VERIFIED alice]')
+            bob.until('\nutf8fixed')
+            # Received messages must identify the authenticated sender on a separate line.
+            for terminal, sender, message in ((alice,'Bob','Bob1'),(bob,'Alice','Alice1')):
+                if not re.search(rb'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \['+sender.encode()+rb'\]\r?\n'+message.encode(), terminal.log):
+                    raise AssertionError('Missing sender heading for '+message)
+            if not debug:
+                for terminal in (alice,bob):
+                    if not re.search(rb'\|\* \|  [0-9a-f]{8}', terminal.log):
+                        raise AssertionError('Missing queued message ID')
+                    if not re.search(rb'\|\*\*\|  [0-9a-f]{8}', terminal.log):
+                        raise AssertionError('Missing delivered message ID')
             # Neither client should print ambiguous SENT acknowledgements in normal mode.
             if not debug:
                 for terminal in (alice,bob):
+                    if b'[E2EE VERIFIED ' in terminal.log or b'[QUEUED]' in terminal.log or b'[DELIVERED]' in terminal.log:
+                        raise AssertionError('Debug output appeared in normal mode')
                     if b'\nSENT\r\n' in terminal.log:
                         raise AssertionError('Unhelpful SENT line was displayed')
             # Verify the debug option separately in an additional test below.
