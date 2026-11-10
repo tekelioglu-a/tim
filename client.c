@@ -12,10 +12,21 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include "message_crypto.h"
+#include "double_ratchet.h"
 #include <limits.h>
+#include <termios.h>
+#include <signal.h>
 
 #define PORT "5555"
 #define MAX_LINE 4096
+#define QUEUE_MAX 16
+static int debug_mode=0;
+#define DEBUG(...) do {if(debug_mode)fprintf(stderr,__VA_ARGS__);}while(0)
+
+static struct termios saved_tty;
+static int saved_tty_valid=0;
+static void restore_tty(void){if(saved_tty_valid)tcsetattr(STDIN_FILENO,TCSANOW,&saved_tty);}
+static void tty_signal(int sig){restore_tty();signal(sig,SIG_DFL);raise(sig);}
 
 static int send_line(SSL *ssl,const char *line) {
     size_t len=strlen(line),off=0;
@@ -48,11 +59,11 @@ static int timestamp(char *buf,size_t size) {
 typedef struct {
  EVP_PKEY *pending;
  char pending_peer[64],sid[SID_LEN*2+1],initpub[DH_LEN*2+1];
- unsigned char session_key[DH_LEN];
  char established_peer[64];
- unsigned char send_chain[32],recv_chain[32];
- uint64_t send_count,recv_count;
+ DRState ratchet;
  int established;
+ char queued[QUEUE_MAX][1201];
+ int qcount;
 } KeyState;
 static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  const char *kind,const char *sid,const char *initpub,const char *resppub) {
@@ -64,67 +75,97 @@ static int key_send(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
  int z=snprintf(line,sizeof(line),"KEY %s %s %s %s %s %s\n",to,kind,sid,initpub,resppub,hex);
  return z>0 && (size_t)z<sizeof(line) && send_line(ssl,line)==0;
 }
+static int send_encrypted(SSL *ssl,EVP_PKEY *identity,const char *from,const char *to,
+ DRState *ratchet,const unsigned char *body,size_t blen) {
+ if(blen>1200 || !ratchet->has_cks)return 0;
+ char stamp[32],headerhex[81],noncehex[25],taghex[33],bodyhex[2401],encrypted[2700],out[3200];
+ unsigned char header[40],nonce[12],tag[16],cipher[1200],sig[SIG_LEN],transcript[3200];size_t tlen=0;
+ if(timestamp(stamp,sizeof(stamp))<0 || !dr_encrypt(ratchet,from,to,stamp,body,blen,header,nonce,tag,cipher))return 0;
+ tohex(header,40,headerhex);tohex(nonce,12,noncehex);tohex(tag,16,taghex);tohex(cipher,blen,bodyhex);
+ int z=snprintf(encrypted,sizeof(encrypted),"D8:%s:%s:%s:%s",headerhex,noncehex,taghex,bodyhex);
+ if(z<0 || (size_t)z>=sizeof(encrypted) || !signed_message(from,to,stamp,encrypted,transcript,sizeof(transcript),&tlen) ||
+ !ed_sign(identity,transcript,tlen,sig))return 0;
+ char sighex[SIG_LEN*2+1];tohex(sig,SIG_LEN,sighex);
+ z=snprintf(out,sizeof(out),"MSG %s %s %s %s\n",to,stamp,sighex,encrypted);
+ return z>0 && (size_t)z<sizeof(out) && send_line(ssl,out)==0;
+}
+static void flush_queue(SSL *ssl,EVP_PKEY *identity,const char *user,KeyState *ks){
+ if(!ks->established || !ks->ratchet.has_cks)return;
+ int done=0;
+ while(done<ks->qcount){
+  const char *msg=ks->queued[done];
+  if(!send_encrypted(ssl,identity,user,ks->established_peer,&ks->ratchet,(const unsigned char*)msg,strlen(msg))){
+   fprintf(stderr,"[ERROR] Queued message could not be encrypted or sent\n");break;
+  }
+  DEBUG("[DEBUG] Queued encrypted message submitted to relay for %s\n",ks->established_peer);done++;
+ }
+ if(done){for(int i=done;i<ks->qcount;i++)memcpy(ks->queued[i-done],ks->queued[i],sizeof(ks->queued[0]));ks->qcount-=done;}
+}
+static int queue_message(KeyState *ks,const char *body){
+ if(strlen(body)>1200 || ks->qcount>=QUEUE_MAX)return 0;
+ strcpy(ks->queued[ks->qcount++],body);return 1;
+}
 static void key_receive(SSL *ssl,char *line,const char *user,EVP_PKEY *identity,
  EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *state) {
  char *parts[6],*save=NULL;
  for(int i=0;i<6;i++)parts[i]=strtok_r(i?NULL:line+8," ",&save);
- if(!parts[5] || strtok_r(NULL," ",&save)) {puts("[REJECTED malformed KEY]");return;}
+ if(!parts[5] || strtok_r(NULL," ",&save)){puts("[REJECTED malformed KEY]");return;}
  char *from=parts[0],*kind=parts[1],*sid=parts[2],*initpub=parts[3],*resppub=parts[4],*sighex=parts[5];
  EVP_PKEY *peer=!strcmp(from,"alice")?alice_pub:!strcmp(from,"bob")?bob_pub:NULL;
  unsigned char sig[SIG_LEN],sidbytes[SID_LEN],initbytes[DH_LEN],replybytes[DH_LEN],transcript[512];size_t n=0;
  if(!peer || !strcmp(from,user) || (strcmp(kind,"INIT") && strcmp(kind,"REPLY")) ||
     !fromhex(sid,sidbytes,SID_LEN) || !fromhex(initpub,initbytes,DH_LEN) ||
-    (strcmp(kind,"INIT")? !fromhex(resppub,replybytes,DH_LEN):strcmp(resppub,"-")!=0) ||
+    (!strcmp(kind,"REPLY")?!fromhex(resppub,replybytes,DH_LEN):strcmp(resppub,"-")!=0) ||
     !fromhex(sighex,sig,SIG_LEN) ||
     !dh_transcript(kind,from,user,sid,initpub,resppub,transcript,sizeof(transcript),&n) ||
-    !ed_verify(peer,transcript,n,sig)) {
-    puts("[REJECTED unauthenticated KEY]");return;
- }
- if(!strcmp(kind,"INIT")) {
+    !ed_verify(peer,transcript,n,sig)) {puts("[REJECTED unauthenticated KEY]");return;}
+ if(!strcmp(kind,"INIT")){
+    if(state->established || state->pending){puts("[REJECTED active/pending session]");return;}
     EVP_PKEY *mine=dh_generate();unsigned char mypub[DH_LEN],secret[DH_LEN],key[DH_LEN];char myhex[DH_LEN*2+1];
-    if(!mine || !dh_public(mine,mypub)) {puts("[KEY generation failed]");EVP_PKEY_free(mine);return;}
+    if(!mine || !dh_public(mine,mypub)){EVP_PKEY_free(mine);return;}
     tohex(mypub,DH_LEN,myhex);
-    int ok=dh_secret(mine,initbytes,secret) &&
-       dh_derive_key(secret,from,user,sid,initpub,myhex,key) &&
-       key_send(ssl,identity,user,from,"REPLY",sid,initpub,myhex);
-    OPENSSL_cleanse(secret,sizeof(secret));EVP_PKEY_free(mine);
-    if(!ok){OPENSSL_cleanse(key,sizeof(key));puts("[KEY exchange failed]");return;}
-    memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
+    int ok=dh_secret(mine,initbytes,secret) && dh_derive_key(secret,from,user,sid,initpub,myhex,key);
+    if(ok)ok=dr_init_responder(&state->ratchet,key,mine);
+    if(ok)ok=key_send(ssl,identity,user,from,"REPLY",sid,initpub,myhex);
+    OPENSSL_cleanse(secret,32);OPENSSL_cleanse(key,32);EVP_PKEY_free(mine);
+    if(!ok){dr_free(&state->ratchet);puts("[KEY exchange failed]");return;}
     snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
-    if(!ratchet_init(state->session_key,user,from,state->send_chain,state->recv_chain)) {puts("[Ratchet init failed]");state->established=0;return;}
-    state->send_count=state->recv_count=0;state->established=1;
-    printf("[STAGE6] Authenticated X25519/HKDF session established with %s (responder)\n",from);
+    state->established=1;
+    DEBUG("[DEBUG /key] Session established with %s (responder); awaiting automatic ratchet bootstrap\n",from);
  } else {
-    if(!state->pending || strcmp(state->pending_peer,from) || strcmp(state->sid,sid) ||
-       strcmp(state->initpub,initpub)) {puts("[REJECTED unexpected KEY reply]");return;}
-    unsigned char secret[DH_LEN],key[DH_LEN];
-    int ok=dh_secret(state->pending,replybytes,secret) &&
-           dh_derive_key(secret,user,from,sid,initpub,resppub,key);
-    OPENSSL_cleanse(secret,sizeof(secret));EVP_PKEY_free(state->pending);state->pending=NULL;
+    if(!state->pending || strcmp(state->pending_peer,from) || strcmp(state->sid,sid) || strcmp(state->initpub,initpub)){
+      puts("[REJECTED unexpected KEY reply]");return;}
+    unsigned char secret[32],key[32];
+    int ok=dh_secret(state->pending,replybytes,secret) && dh_derive_key(secret,user,from,sid,initpub,resppub,key);
+    if(ok)ok=dr_init_initiator(&state->ratchet,key,replybytes);
+    OPENSSL_cleanse(secret,32);OPENSSL_cleanse(key,32);
+    EVP_PKEY_free(state->pending);state->pending=NULL;
     if(!ok){puts("[KEY derivation failed]");return;}
-    memcpy(state->session_key,key,DH_LEN);OPENSSL_cleanse(key,sizeof(key));
     snprintf(state->established_peer,sizeof(state->established_peer),"%s",from);
-    if(!ratchet_init(state->session_key,user,from,state->send_chain,state->recv_chain)) {puts("[Ratchet init failed]");state->established=0;return;}
-    state->send_count=state->recv_count=0;state->established=1;
-    printf("[STAGE6] Authenticated X25519/HKDF session established with %s (initiator)\n",from);
+    state->established=1;
+    DEBUG("[DEBUG /key] Session established with %s (initiator)\n",from);
+    /* The first encrypted ratchet message is an internal control frame.
+       It advances Bob's receive chain and creates his sending chain. */
+    const unsigned char bootstrap[1]={1};
+    if(!send_encrypted(ssl,identity,user,from,&state->ratchet,bootstrap,1)){
+       fprintf(stderr,"[ERROR] Automatic ratchet bootstrap failed\n");return;
+    }
+    DEBUG("[DEBUG /rekey] Initial automatic DH ratchet bootstrap sent to %s\n",from);
+    flush_queue(ssl,identity,user,state);
  }
- /* Stage 6 does NOT use this secret to encrypt messages yet. */
 }
 static int key_initiate(SSL *ssl,EVP_PKEY *identity,const char *user,const char *peer,KeyState *state) {
- if((strcmp(peer,"alice") && strcmp(peer,"bob")) || !strcmp(peer,user))return 0;
- EVP_PKEY *mine=dh_generate();unsigned char pub[DH_LEN],sid[SID_LEN];
- if(!mine || !dh_public(mine,pub) || RAND_bytes(sid,sizeof(sid))!=1){EVP_PKEY_free(mine);return 0;}
- char pubhex[DH_LEN*2+1],sidhex[SID_LEN*2+1];tohex(pub,DH_LEN,pubhex);tohex(sid,SID_LEN,sidhex);
+ if((strcmp(peer,"alice") && strcmp(peer,"bob")) || !strcmp(peer,user) || state->pending || state->established)return 0;
+ EVP_PKEY *mine=dh_generate();unsigned char pub[32],sid[16];
+ if(!mine || !dh_public(mine,pub) || RAND_bytes(sid,16)!=1){EVP_PKEY_free(mine);return 0;}
+ char pubhex[65],sidhex[33];tohex(pub,32,pubhex);tohex(sid,16,sidhex);
  if(!key_send(ssl,identity,user,peer,"INIT",sidhex,pubhex,"-")){EVP_PKEY_free(mine);return 0;}
- EVP_PKEY_free(state->pending);state->pending=mine;
- strcpy(state->pending_peer,peer);
- strcpy(state->sid,sidhex);strcpy(state->initpub,pubhex);
- printf("[STAGE6] Sent signed ephemeral X25519 public key to %s\n",peer);
- return 1;
+ state->pending=mine;strcpy(state->pending_peer,peer);strcpy(state->sid,sidhex);strcpy(state->initpub,pubhex);
+ DEBUG("[DEBUG /key] Sent authenticated X25519 initialization to %s\n",peer);return 1;
 }
-static void display_verified(char *line,const char *user,
+static void display_verified(SSL *ssl,EVP_PKEY *identity,char *line,const char *user,
                              EVP_PKEY *alice_pub,EVP_PKEY *bob_pub,KeyState *ks) {
- if(strncmp(line,"FROM ",5)!=0){printf("%s\n> ",line);return;}
+ if(strncmp(line,"FROM ",5)!=0){if(!strcmp(line,"KEYSENT")){DEBUG("[DEBUG /key] Server acknowledged key-exchange frame\n");return;}if(!strcmp(line,"SENT")){DEBUG("[DEBUG] Relay accepted outgoing ciphertext (not a delivery receipt)\n");return;}printf("%s\n> ",line);return;}
  char *from=line+5,*stamp=strchr(from,' ');
  if(!stamp){puts("[REJECTED malformed message]");return;}*stamp++=0;
  char *sighex=strchr(stamp,' ');
@@ -138,33 +179,33 @@ static void display_verified(char *line,const char *user,
     !ed_verify(peer,transcript,n,sig)){
     printf("[REJECTED invalid signature from %s]\n> ",from);return;
  }
- if(strncmp(body,"E7:",3)!=0){puts("[REJECTED unencrypted message]\n> ");return;}
- if(!ks->established || strcmp(ks->established_peer,from)){
-    puts("[REJECTED no active encrypted session]\n> ");return;
+ if(strncmp(body,"D8:",3)!=0){puts("[REJECTED unencrypted message]");return;}
+ if(!ks->established || strcmp(ks->established_peer,from)){puts("[REJECTED no active session]");return;}
+ char *pieces[4],*save=NULL;
+ for(int i=0;i<4;i++)pieces[i]=strtok_r(i?NULL:body+3,":",&save);
+ if(!pieces[3] || strtok_r(NULL,":",&save)){puts("[REJECTED malformed ciphertext]");return;}
+ size_t clen=strlen(pieces[3])/2;
+ if(clen==0 || clen>1200 || strlen(pieces[3])!=2*clen){puts("[REJECTED ciphertext length]");return;}
+ unsigned char header[40],nonce[12],tag[16],cipher[1200],plain[1201];
+ if(!fromhex(pieces[0],header,40) || !fromhex(pieces[1],nonce,12) ||
+    !fromhex(pieces[2],tag,16) || !fromhex(pieces[3],cipher,clen)){
+    puts("[REJECTED ciphertext encoding]");return;}
+ unsigned char prior_pub[32];int had_prior=ks->ratchet.has_dhr;memcpy(prior_pub,ks->ratchet.dhr,32);
+ int was_ready=ks->ratchet.has_cks;
+ if(!dr_decrypt(&ks->ratchet,from,user,stamp,header,nonce,tag,cipher,clen,plain)){
+    puts("[REJECTED ratchet/authentication/replay]");return;}
+ if(had_prior && memcmp(prior_pub,header,32)!=0)DEBUG("[DEBUG /rekey] Automatic DH ratchet transition from %s\n",from);
+ if(!was_ready && ks->ratchet.has_cks){
+   DEBUG("[DEBUG /rekey] Automatic DH ratchet activated for %s\n",from);
+   flush_queue(ssl,identity,user,ks);
  }
- char *ctr=body+3,*noncehex=strchr(ctr,':');if(!noncehex){puts("[REJECTED malformed ciphertext]");return;}
- *noncehex++=0;char *taghex=strchr(noncehex,':');if(!taghex){puts("[REJECTED malformed ciphertext]");return;}
- *taghex++=0;char *cipherhex=strchr(taghex,':');if(!cipherhex){puts("[REJECTED malformed ciphertext]");return;}
- *cipherhex++=0;
- if(!*ctr || strlen(ctr)>20 || (strlen(ctr)>1 && *ctr=='0')){puts("[REJECTED counter]");return;}
- for(char *p=ctr;*p;p++)if(*p<'0'||*p>'9'){puts("[REJECTED counter]");return;}
- errno=0;char *last=NULL;uint64_t counter=strtoull(ctr,&last,10);
- if(errno || !last || *last || counter!=ks->recv_count){puts("[REJECTED replay/out-of-order message]");return;}
- size_t clen=strlen(cipherhex)/2;
- if(!clen || strlen(cipherhex)!=2*clen || clen>MAX_LINE/2){puts("[REJECTED ciphertext length]");return;}
- unsigned char nonce[12],tag[16],cipher[MAX_LINE/2],plain[MAX_LINE/2+1];
- if(!fromhex(noncehex,nonce,12)||!fromhex(taghex,tag,16)||!fromhex(cipherhex,cipher,clen)){
-    puts("[REJECTED ciphertext encoding]");return;
- }
- unsigned char key[32],next[32],aad[256];size_t aadlen=0;
- int ok=ratchet_kdf(ks->recv_chain,"message",key) && ratchet_kdf(ks->recv_chain,"next",next) &&
-    message_aad(from,user,stamp,ctr,aad,sizeof(aad),&aadlen) &&
-    aead_crypt(0,key,nonce,aad,aadlen,cipher,clen,plain,tag);
- OPENSSL_cleanse(key,sizeof(key));
- if(!ok){OPENSSL_cleanse(next,sizeof(next));puts("[REJECTED authentication/tag failure]");return;}
- memcpy(ks->recv_chain,next,32);OPENSSL_cleanse(next,sizeof(next));ks->recv_count++;
+ if(clen==1 && plain[0]==1){OPENSSL_cleanse(plain,sizeof(plain));return;}
  plain[clen]=0;
- if(memchr(plain,0,clen)){puts("[REJECTED binary text]");return;}
+ if(memchr(plain,0,clen)){OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED binary text]");return;}
+ /* Reject control characters in authenticated peer text: do not execute terminal escapes. */
+ for(size_t j=0;j<clen;j++)if(plain[j]<32 || plain[j]==127){
+   OPENSSL_cleanse(plain,sizeof(plain));puts("[REJECTED control character in message]");return;
+ }
  printf("[E2EE VERIFIED %s] %s %s\n> ",from,stamp,plain);
  OPENSSL_cleanse(plain,sizeof(plain));
 }
@@ -200,7 +241,7 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
                 printf("Enter: recipient message (or QUIT)\n> ");
             } else {
                 if(!strncmp(line,"KEYFROM ",8))key_receive(ssl,line,user,key,alice_pub,bob_pub,ks);
-                else display_verified(line,user,alice_pub,bob_pub,ks);
+                else display_verified(ssl,key,line,user,alice_pub,bob_pub,ks);
             }
             fflush(stdout);
             *used=0; *overflow=0;
@@ -212,8 +253,13 @@ static int read_messages(SSL *ssl,char *line,size_t *used,int *overflow,int *sta
     return 0;
 }
 int main(int argc,char **argv) {
-    if (argc!=7) {
-        fprintf(stderr,"Usage: %s HOST USER identity.key ca.crt alice.pub bob.pub\n",argv[0]);return 1;
+    if (argc!=7 && argc!=8) {
+        fprintf(stderr,"Usage: %s [-d] HOST USER identity.key ca.crt alice.pub bob.pub\n",argv[0]);return 1;
+    }
+    if(argc==8){
+       if(!strcmp(argv[1],"-d")){debug_mode=1;argv++;argc--;}
+       else if(!strcmp(argv[7],"-d")){debug_mode=1;argc--;}
+       else {fprintf(stderr,"Unknown option: %s\n",argv[7]);return 1;}
     }
     EVP_PKEY *identity=load_key(argv[3],1);
     if (!identity) {fprintf(stderr,"Invalid Ed25519 private identity key\n");return 1;}
@@ -253,74 +299,108 @@ int main(int argc,char **argv) {
     }
     char line[MAX_LINE];size_t used=0;int overflow=0,auth_state=0;
     KeyState ks={0};
+    /* Read stdin with read(2), never mix poll(2) with buffered fgets(3).
+       On terminals disable echo/canonical buffering and redraw the current line
+       after asynchronous network output. */
+    struct termios oldtty={0};
+    int interactive=isatty(STDIN_FILENO), tty_changed=0;
+    if(interactive && tcgetattr(STDIN_FILENO,&oldtty)==0){
+        struct termios tty=oldtty;
+        tty.c_lflag &= (tcflag_t)~(ICANON|ECHO);
+        tty.c_cc[VMIN]=1;tty.c_cc[VTIME]=0;
+        if(tcsetattr(STDIN_FILENO,TCSANOW,&tty)==0){
+            tty_changed=1;saved_tty=oldtty;saved_tty_valid=1;
+            atexit(restore_tty);
+            signal(SIGINT,tty_signal);signal(SIGTERM,tty_signal);
+        }
+    }
+    char input[MAX_LINE]={0};size_t input_len=0;
     struct pollfd fds[2]={{.fd=STDIN_FILENO,.events=POLLIN},
                           {.fd=fd,.events=POLLIN}};
     int done=0;
     while (!done) {
+        fds[0].revents=fds[1].revents=0;
         int ready=SSL_pending(ssl)>0 ? 1 : poll(fds,2,-1);
         if (ready<0) { if(errno==EINTR)continue;perror("poll");break; }
         if (SSL_pending(ssl)>0 || (fds[1].revents & POLLIN)) {
+            if(tty_changed && auth_state==2){fputs("\r\033[2K",stdout);fflush(stdout);}
             if (read_messages(ssl,line,&used,&overflow,&auth_state,identity,argv[2],alice_pub,bob_pub,&ks)<0) {
                 fprintf(stderr,"Server disconnected or TLS read failed\n");break;
+            }
+            if(tty_changed && auth_state==2){
+                /* Only the bytes actually typed are part of the live input. */
+                printf("\r\033[2K> %.*s",(int)input_len,input);fflush(stdout);
             }
         }
         if (fds[1].revents & (POLLERR|POLLHUP|POLLNVAL)) break;
         if (auth_state==2 && (fds[0].revents & POLLIN)) {
-            char input[MAX_LINE];
-            if (!fgets(input,sizeof(input),stdin)) break;
-            size_t len=strlen(input);
-            if (len && input[len-1]!='\n' && !feof(stdin)) {
-                int ch;while ((ch=getchar())!='\n' && ch!=EOF) {}
-                fprintf(stderr,"Input too long\n> ");continue;
-            }
-            input[strcspn(input,"\r\n")]=0;
-            if (!strcmp(input,"QUIT")) { send_line(ssl,"QUIT\n");break; }
-            if (!strncmp(input,"/key ",5)) {
-                if(!key_initiate(ssl,identity,argv[2],input+5,&ks))fprintf(stderr,"Key initiation failed\n");
+            unsigned char ch;
+            ssize_t nr=read(STDIN_FILENO,&ch,1);
+            if(nr==0){done=1;continue;}
+            if(nr<0){if(errno==EINTR)continue;done=1;continue;}
+            if(ch==127 || ch==8){
+                if(input_len){
+                    /* Remove an entire UTF-8 codepoint, not just its final byte. */
+                    do { --input_len; } while(input_len && ((unsigned char)input[input_len]&0xc0)==0x80);
+                    input[input_len]=0;
+                    if(tty_changed){fputs("\r\033[2K> ",stdout);fwrite(input,1,input_len,stdout);fflush(stdout);}
+                }
                 continue;
             }
-            char *body=strchr(input,' ');
+            if(ch!='\n' && ch!='\r'){
+                if(ch<32 || ch==127)continue; /* Never send terminal control characters. */
+                if(input_len+1>=sizeof(input)){
+                    fprintf(stderr,"\nInput too long; line cleared\n> ");input_len=0;input[0]=0;continue;
+                }
+                input[input_len++]=(char)ch;input[input_len]=0;
+                if(tty_changed){fputc(ch,stdout);fflush(stdout);}
+                continue;
+            }
+            if(tty_changed){fputc('\n',stdout);fflush(stdout);}
+            input[input_len]=0;input_len=0;
+            char command[MAX_LINE];
+            memcpy(command,input,strlen(input)+1);
+            input[0]=0; /* Never redraw the previous command. */
+            if(!*command){if(tty_changed){fputs("> ",stdout);fflush(stdout);}continue;}
+            if (!strcmp(command,"QUIT")) { send_line(ssl,"QUIT\n");break; }
+            if(command[0]=='/') {
+                fprintf(stderr,"Commands /key and /rekey are automatic. Type: recipient message\n> ");continue;
+            }
+            char *body=strchr(command,' ');
             if (!body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
             *body++=0;while (*body==' ') ++body;
-            if (!*input || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
-            char stamp[32];
-            if (timestamp(stamp,sizeof(stamp))<0) break;
-            if(!ks.established || strcmp(ks.established_peer,input)){
-                fprintf(stderr,"No established E2EE session with %s; use /key %s first\n> ",input,input);continue;
+            if (!*command || !*body) { fprintf(stderr,"Usage: recipient message\n> ");continue; }
+            if((strcmp(command,"alice") && strcmp(command,"bob")) || !strcmp(command,argv[2])){
+                fprintf(stderr,"Unknown recipient\n> ");continue;
             }
-            char ctr[32],noncehex[25],taghex[33],bodyhex[MAX_LINE],encrypted[MAX_LINE];
-            snprintf(ctr,sizeof(ctr),"%" PRIu64,ks.send_count);
-            unsigned char nonce[12],tag[16],keybytes[32],next[32],aad[256];size_t aadlen=0;
-            size_t blen=strlen(body);unsigned char cipher[MAX_LINE];
-            if(blen>1200 || RAND_bytes(nonce,sizeof(nonce))!=1 ||
-               !ratchet_kdf(ks.send_chain,"message",keybytes) ||
-               !ratchet_kdf(ks.send_chain,"next",next) ||
-               !message_aad(argv[2],input,stamp,ctr,aad,sizeof(aad),&aadlen) ||
-               !aead_crypt(1,keybytes,nonce,aad,aadlen,(unsigned char*)body,blen,cipher,tag)){
-                OPENSSL_cleanse(keybytes,sizeof(keybytes));fprintf(stderr,"Encryption failed or message too long\n> ");continue;
+            if(ks.established && strcmp(ks.established_peer,command)){
+                fprintf(stderr,"[ERROR] This prototype supports only one active peer\n> ");continue;
             }
-            OPENSSL_cleanse(keybytes,sizeof(keybytes));
-            tohex(nonce,12,noncehex);tohex(tag,16,taghex);tohex(cipher,blen,bodyhex);
-            int ez=snprintf(encrypted,sizeof(encrypted),"E7:%s:%s:%s:%s",ctr,noncehex,taghex,bodyhex);
-            if(ez<0 || (size_t)ez>=sizeof(encrypted)){
-                OPENSSL_cleanse(next,sizeof(next));fprintf(stderr,"Encrypted message too long\n> ");continue;
+            if(ks.pending && strcmp(ks.pending_peer,command)){
+                fprintf(stderr,"[ERROR] Key exchange already in progress for another peer\n> ");continue;
             }
-            body=encrypted;
-            unsigned char transcript[MAX_LINE+128],sig[SIG_LEN];size_t tlen=0;
-            if (!signed_message(argv[2],input,stamp,body,transcript,sizeof(transcript),&tlen) ||
-                !ed_sign(identity,transcript,tlen,sig)) {
-                fprintf(stderr,"Message signing failed\n> ");continue;
+            if(ks.established && ks.ratchet.has_cks && ks.qcount==0){
+                if(!send_encrypted(ssl,identity,argv[2],command,&ks.ratchet,(const unsigned char*)body,strlen(body))){
+                    fprintf(stderr,"Encryption failed (maximum message length: 1200 bytes)\n> ");continue;
+                }
+                DEBUG("[DEBUG] Encrypted message submitted to relay for %s\n",command);
+            }else{
+                if(!queue_message(&ks,body)){
+                    fprintf(stderr,"[ERROR] Message exceeds 1200 bytes or pending queue is full\n> ");continue;
+                }
+                if(!ks.established && !ks.pending && !key_initiate(ssl,identity,argv[2],command,&ks)){
+                    fprintf(stderr,"[ERROR] Automatic key exchange failed\n> ");
+                }else{
+                    DEBUG("[DEBUG] Queued message for %s (pending=%d)\n",command,ks.qcount);
+                }
+                if(tty_changed){fputs("> ",stdout);fflush(stdout);}
             }
-            char sighex[SIG_LEN*2+1];tohex(sig,SIG_LEN,sighex);
-            n=snprintf(out,sizeof(out),"MSG %s %s %s %s\n",input,stamp,sighex,body);
-            if (n<0 || n>=MAX_LINE) { fprintf(stderr,"Message too long\n> ");continue; }
-            if (send_line(ssl,out)<0) { fprintf(stderr,"TLS write failed\n");break; }
-            memcpy(ks.send_chain,next,32);OPENSSL_cleanse(next,sizeof(next));ks.send_count++;
+
         }
         if (fds[0].revents & (POLLERR|POLLHUP|POLLNVAL)) done=1;
     }
-    EVP_PKEY_free(ks.pending);OPENSSL_cleanse(ks.session_key,sizeof(ks.session_key));
-    OPENSSL_cleanse(ks.send_chain,sizeof(ks.send_chain));OPENSSL_cleanse(ks.recv_chain,sizeof(ks.recv_chain));
+    if(tty_changed)tcsetattr(STDIN_FILENO,TCSANOW,&oldtty);
+    EVP_PKEY_free(ks.pending);dr_free(&ks.ratchet);
     SSL_shutdown(ssl);SSL_free(ssl);close(fd);SSL_CTX_free(ctx);EVP_PKEY_free(identity);EVP_PKEY_free(alice_pub);EVP_PKEY_free(bob_pub);
     return 0;
 }

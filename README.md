@@ -1,34 +1,46 @@
-# Stage 7: Experimental E2EE text messages
+# Stage 8 — Automatic E2EE session setup (C/OpenSSL)
 
-**Educational prototype only. Not Signal Double Ratchet and not production secure.**
+This is an **experimental prototype**, not an independently audited messenger. Do not use for sensitive communications. Sessions are held in memory; there is no offline delivery, persistent ratchet state, crash recovery, or authenticated delivery acknowledgement. The server must have both users connected; queued messages are held only in client RAM. This release supports one peer session per client process.
 
-Build on Linux with OpenSSL 3 development headers:
+## Build and tests
 
 ```sh
-gcc -Wall -Wextra -Wpedantic -Werror -O2 -pthread server.c -o server -lssl -lcrypto
-gcc -Wall -Wextra -Wpedantic -Werror -O2 client.c -o client -lssl -lcrypto
+./test_all.sh
 ```
 
-For a fresh *local test only* run `sh make-certs.sh` and `sh make-identities.sh`. **Never regenerate an existing user's identity keys**; copy the existing trusted identity files instead.
+The test script builds with `-Wall -Wextra -Werror`, runs the standalone Double Ratchet tests, and exercises live TLS/Ed25519/X25519 messaging in both directions, including first-message automatic key exchange and `-d` diagnostics.
 
-Run in three terminals:
+## Run
+
+Generate credentials using `make-certs.sh` and `make-identities.sh`, then start the server:
 
 ```sh
 ./server server.crt server.key alice.pub bob.pub
+```
+
+In two terminals:
+
+```sh
 ./client localhost alice alice.key ca.crt alice.pub bob.pub
 ./client localhost bob bob.key ca.crt alice.pub bob.pub
 ```
 
-Alice types `/key bob`, waits for `[STAGE6] ... session established`, then types `bob Hello Bob!`. Bob sees `[E2EE VERIFIED alice] ... Hello Bob!` and can respond with `alice Hello Alice!`.
+Send `bob Hello` from Alice or `alice Hello` from Bob. The initial X25519 handshake, internal encrypted bootstrap, and subsequent DH ratchet transitions are automatic. A small queue holds up to 16 messages (up to 1200 bytes each) during session setup; this queue is **not persistent**. The first queued message is sent after handshake completion, and a recipient's first outgoing message works after the encrypted bootstrap arrives. There is no plaintext fallback.
 
-Messages are encrypted client-side using AES-256-GCM and signed with Ed25519. The server sees `E7:counter:nonce:tag:ciphertext` rather than plaintext. Each direction derives a new 32-byte message key and advances its chain after successful processing. AES-GCM additionally authenticates sender, recipient, timestamp and counter as associated data. The TLS 1.3 layer remains in place.
+To see protocol diagnostics, run either client with `-d`:
 
-## Important limitations
+```sh
+./client -d localhost alice alice.key ca.crt alice.pub bob.pub
+```
 
-* This is a **sequential, in-memory, single-peer demonstration**, not Signal's Double Ratchet. No ongoing DH ratchet, offline delivery, skipped-key storage, durable replay protection, or post-compromise recovery.
-* The signed X25519 handshake from Stage 6 lacks durable replay protection and explicit key confirmation. A malicious relay can replay handshake requests, with possible session resets and denial of service. No asynchronous prekeys.
-* Reordering, message loss, reconnection, simultaneous initiation, and multiple devices/sessions are **not handled safely**. A lost message desynchronizes the chain. The relay may fan out to multiple devices, which this demo cannot support.
-* Keys are in process memory; device capture, malicious endpoints, compromised identity keys, and traffic metadata remain threats. The server can block, reorder and replay traffic, and can see participants and ciphertext lengths.
-* Only `alice` and `bob` are supported. Text messages are limited to approximately 1200 bytes, and plaintext is not padded. No attachments or media.
-* The proposed separate X25519-derived XOR-pad layer has **not** been implemented.
-* No independent audit, fuzzing campaign, formal protocol review, or production hardening has been performed. Do not use for sensitive conversations.
+`-d` logs automatic `/key` operations and `/rekey`-equivalent DH ratchet events. Neither command is accepted as a user command. Normal operation suppresses these diagnostics. `QUIT` ends the session.
+
+## Limitations
+
+This is **not** the full Signal protocol. No X3DH/PQXDH, prekey server, offline delivery, multi-device support, disk-backed state, durable outgoing queue, exactly-once delivery, or security audit. Both clients must be connected and each client only supports one peer at a time. Simultaneous first-contact initiation and disconnect/reconnect recovery are not guaranteed. Do not treat `SENT` as a recipient delivery acknowledgement.
+
+## Terminal input fix (November 9)
+- Normal mode suppresses ambiguous `SENT` lines; `-d` reports relay acceptance, explicitly not delivery confirmation.
+- Backspace deletes complete UTF-8 codepoints (e.g., `ş`), rather than leaving invalid bytes in outgoing text.
+- ASCII control characters are ignored on input and rejected on authenticated incoming plaintext to prevent terminal escape injection.
+- Messages remain limited to 1200 bytes. Delivery acknowledgments, persistence, and offline recovery are not implemented.

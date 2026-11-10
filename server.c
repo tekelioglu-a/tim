@@ -141,9 +141,9 @@ static int command(Client *c, char *line) {
         char *fields[6]={0};char *save=NULL;
         for (int i=0;i<6;i++) fields[i]=strtok_r(i?NULL:line+4," ",&save);
         if (!fields[5] || strtok_r(NULL," ",&save) || !identity_key(fields[0]) ||
-            (strcmp(fields[1],"INIT") && strcmp(fields[1],"REPLY")) ||
+            (strcmp(fields[1],"INIT") && strcmp(fields[1],"REPLY") && strcmp(fields[1],"RINIT") && strcmp(fields[1],"RREPLY")) ||
             strlen(fields[2])!=SID_LEN*2 || strlen(fields[3])!=DH_LEN*2 ||
-            (strcmp(fields[1],"INIT") ? strlen(fields[4])!=DH_LEN*2 : strcmp(fields[4],"-")) ||
+            ((strcmp(fields[1],"INIT") && strcmp(fields[1],"RINIT")) ? strlen(fields[4])!=DH_LEN*2 : strcmp(fields[4],"-")) ||
             strlen(fields[5])!=SIG_LEN*2) {
             enqueue(c,"ERR Invalid key exchange\n");return 0;
         }
